@@ -17,8 +17,8 @@ namespace fs = std::filesystem;
 
 static void usage() {
     fprintf(stderr,
-            "nevtoraw info <file.NEV>\n"
-            "nevtoraw dng  <file.NEV> [options]\n"
+            "nevtoraw [dng] <file.NEV> [options]   extract frames as DNG (dng is the default)\n"
+            "nevtoraw info  <file.NEV>             show clip and frame 0 details\n"
             "  -f, --frames LIST   frames to extract: 0 | 0-10 | 0,12,50 | 0-143:6 | all (default 0)\n"
             "  -o, --output DIR    output directory (default: next to the NEV)\n"
             "  -c, --compression C ljpeg (default, lossless) | none\n"
@@ -81,13 +81,24 @@ static int cmd_info(const std::string &path) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3) { usage(); return 2; }
-    std::string cmd = argv[1], path = argv[2];
-    if (cmd == "info") return cmd_info(path);
-    if (cmd != "dng") { usage(); return 2; }
+    if (argc < 2) { usage(); return 2; }
+    std::string cmd = argv[1];
+    if (cmd == "info") {
+        if (argc != 3) { usage(); return 2; }
+        return cmd_info(argv[2]);
+    }
+    // "dng" is the default: `nevtoraw <file.NEV> [options]` == `nevtoraw dng <file.NEV> [options]`
+    int first = 2;
+    if (cmd == "dng") {
+        if (argc < 3) { usage(); return 2; }
+        first = 3;
+    } else if (cmd.empty() || cmd[0] == '-') {
+        usage(); return 2;
+    }
+    std::string path = argv[first - 1];
     std::string frames = "0", outdir;
     nev::DngOptions opt;
-    for (int i = 3; i < argc; i++) {
+    for (int i = first; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
         if (a == "-f" || a == "--frames") frames = next();

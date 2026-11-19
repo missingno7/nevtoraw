@@ -3,9 +3,12 @@
 Extracts frames of Nikon **N-RAW** video (`.NEV`, e.g. Z 8) as raw stills.
 
 ```
-nevtoraw info <file.NEV>
-nevtoraw dng  <file.NEV> [-f 0 | 0-10 | 0,12,50 | 0-143:6 | all] [-o DIR] [-c ljpeg|none] [--white N]
+nevtoraw [dng] <file.NEV> [-f 0 | 0-10 | 0,12,50 | 0-143:6 | all] [-o DIR] [-c ljpeg|none] [--white N]
+nevtoraw info  <file.NEV>
 ```
+
+`dng` is the default, so `nevtoraw clip.NEV -f all -o out` works. Without `-f` only frame 0 is
+exported.
 
 Build: `mingw32-make` (MSYS2 MinGW-w64 g++, C++17), producing one static `nevtoraw.exe`.
 The HE/TicoRAW decoder in `third_party/nikon-he-public` and `src/he_decode.cpp` come from
