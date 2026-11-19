@@ -1,0 +1,23 @@
+# Personal footage and generated outputs: never commit
+/examples/
+/out/
+
+# Build artifacts
+*.exe
+*.o
+*.part
+
+# Raw/image/video files anywhere
+*.NEV
+*.nev
+*.nef
+*.NEF
+*.dng
+*.DNG
+*.jpg
+*.JPG
+*.png
+*.pgm
+
+__pycache__/
+*.pyc
