@@ -11,18 +11,30 @@ Build: `mingw32-make` (MSYS2 MinGW-w64 g++, C++17), producing one static `nevtor
 The HE/TicoRAW decoder in `third_party/nikon-he-public` and `src/he_decode.cpp` come from
 [nefcomp](https://github.com/missingno7/nefcomp).
 
-## Findings (Z 8 FW 4.06, `examples/DSC_7345.NEV`)
+## Findings (Z 8 FW 4.06)
 
-**Container.** ISO-BMFF/MOV (`ftyp niko`). Video track sample entry `NRAW`, 8268×4652,
-59.94 fps (`stts` 1001 @ 60000), one frame per chunk (`co64`). `udta/NCDT` holds `NCTG` (movie tags:
-model, firmware, date, fps, output size 8256×4644 at 0x22/0x23, lens, serial, shutter count
-0x20000a7, makernote-style tags at 0x2000xxx), `NCTH`/`NCVW`/`NCM1` JPEGs.
+**Tested modes.** All are 12-bit N-RAW, decoded to a 14-bit RGGB Bayer mosaic with black 1008.
 
-**Sensor area.** Makernote CropHiSpeed (NCTG 0x200001b) = `6, 8280, 5520, 8280, 4656, 0, 432`:
-a 16:9 crop that keeps the full FX width (8280 px) and reads rows 432…5087 of the 5520-row sensor.
-The coded frame (8268×4652) is that band minus a 6/2 px border, so it's FX width, not DX.
+| clip | mode | coded | output (DefaultCrop) | sensor area (CropHiSpeed) | bpp | sampling |
+| --- | --- | --- | --- | --- | --- | --- |
+| DSC_7345 | 8.3K 59.94p | 8268×4652 | 8256×4644 | `6`: 8280×4656 at row 432 (FX width, 16:9) | 2.50 | 1:1 |
+| DSC_7346 | 4.1K 119.88p | 4140×2330 | 4128×2322 | `6`: 8280×4656 at row 432 (same FX band) | 3.00 | ½ in each direction, still a clean Bayer pattern |
+| DSC_7347 | UHD 119.88p | 3852×2168 | 3840×2160 | `20`: 3856×2176 at (2212, 1672) | 3.00 | 1:1 centre crop (≈2.15×) |
 
-**Frame sample** (12,020,736 bytes each, constant):
+The 4.1K mode covers the full FX field at half resolution: the sensor bins or scales same-colour
+pixels, and the result is a regular RGGB mosaic (G1/G2 balanced, no CFA artefacts). UHD 120p is a
+native-resolution centre crop. Each makes a valid DNG.
+
+**Container.** ISO-BMFF/MOV (`ftyp niko`). Video track sample entry `NRAW` with the coded size,
+`stts`/`mdhd` for the frame rate, one frame per chunk (`co64`). `udta/NCDT` holds `NCTG` (movie tags:
+model, firmware, date, fps, output size at 0x22/0x23, lens, serial, shutter count 0x20000a7,
+makernote-style tags at 0x2000xxx), `NCTH`/`NCVW`/`NCM1` JPEGs.
+
+**Sensor area.** Makernote CropHiSpeed (NCTG 0x200001b) is `mode, sensor w, sensor h, area w,
+area h, left, top`. For 8.3K and 4.1K it is `6, 8280, 5520, 8280, 4656, 0, 432`, a 16:9 band of the
+full sensor width. The coded frame is the area (or half of it) minus a 6/2 px border on each side.
+
+**Frame sample** (constant size per clip; 12,020,736 bytes for 8.3K):
 
 | offset | content |
 | --- | --- |
@@ -40,36 +52,38 @@ levels, `0x003d` black 1008, `0x0045` crop 6,4,8256,4644, `0x0058` codestream si
 
 **Codec.** It's the same intoPIX TicoRAW as the stills' HE/HE★ NEFs. The picture header is
 byte-identical to a Z 8 HE NEF apart from Lcod/width/height (same CDT/WGT, same companding
-extension with black 1008). The "12-bit" N-RAW decodes to the 14-bit scale. At 2.50 bpp it is
-below both HE (3 bpp) and HE★ (5 bpp). nefcomp's bundled decoder handles it unchanged, about
-0.65 s per frame.
+extension with black 1008). The "12-bit" N-RAW decodes to the 14-bit scale. 8.3K uses 2.50 bpp,
+below both HE (3 bpp) and HE★ (5 bpp); the 120p modes use 3.00. Decoding takes about 0.65 s per
+8.3K frame and 0.16 s per 4.1K/UHD frame.
+
+**Decoder fix.** The bundled decoder's sub-band layout (`nikon_he_subband_config.cpp`) estimated
+the 5-level wavelet band sizes from the level-1 group count. That is exact for the stills widths and
+for 8268/4140, but off by one group at 3852 (UHD), so UHD frames failed to decode. It now derives
+each band from the halving the 5/3 lift actually performs. 8.3K and 4.1K output is bit-identical to
+before.
 
 ## Outputs
 
 ### DNG (implemented)
 Uncompressed or tiled lossless JPEG (Compression 7, 256×256, 2-component CFA trick). Each file
 carries Adobe's Z 8 ColorMatrix1/2 (from DNG Converter 17.2), AsShotNeutral from the frame's WB,
-BlackLevel from the codestream, DefaultCrop (6,4)+8256×4644, FrameRate, Exif (per-frame exposure,
-ISO, lens, date + offset, SubSecTime) and the original file name.
+BlackLevel from the codestream, DefaultCrop (6,4) + the camera's output size, FrameRate, Exif
+(per-frame exposure, ISO, lens, date + offset, SubSecTime) and the original file name.
 
-* dcraw decodes both variants bit-identical to the decoder output.
-* Adobe DNG Converter 17.2 accepts them, its raw data is identical, it renders correct colour and
-  it applies the 8256×4644 crop.
-* Size: 46.7 MB/frame lossless (noise at ISO 10000 limits compression), against a 12 MB source frame.
+* dcraw decodes both variants bit-identical to the decoder output (frames across all three clips).
+* Adobe DNG Converter 17.2 accepts all three modes, its raw data is identical, and it applies the
+  output crop (8256×4644, 4128×2322, 3840×2160). The 8.3K render has correct colour.
+* Size (lossless JPEG): 46.7 MB per 8.3K frame (noise at ISO 10000 limits compression, against a
+  12 MB source frame), 11.7 MB per 4.1K frame and 11.2 MB per UHD frame.
 * Other cameras: the matrices fall back to the frame's own matrix (single illuminant), which is
   untested.
 * White level 16383 is unverified: this clip has no clipped highlights.
 
-### NEF (experiment, not implemented)
-The frame's codestream can go unchanged into a Z 8 HE NEF container, which keeps the data
-bit-exact at about 17 MB. In the test, the template was a camera HE NEF with patched raw-IFD
-dimensions, StripByteCounts, makernote 0x0058 and 0xC7D5/0x000F (with CRC). Adobe DNG Converter
-opens it and decodes it **bit-identically**.
-
-**But** Adobe applies a centred DX-sized default crop (5392×3592) for this raw size. Changing
-makernote 0x0045 (CropArea) or 0x001b (CropHiSpeed) has no effect, so it is probably Adobe's
-own size table. The template's previews, WB (0x000c/0x0097), shutter count and Exif would also
-have to be replaced per frame. NX Studio, LibRaw and darktable were not tested.
+### NEF (not pursued)
+A frame's codestream placed unchanged into a Z 8 HE NEF opens in Adobe DNG Converter and decodes
+bit-identically, which independently confirms the 8.3K decode. Adobe gives such NEFs a centred
+DX-sized crop (5392×3592) whatever the makernote says, and rejects the smaller 4.1K/UHD sizes,
+so DNG is the only output.
 
 ## Credits / licences
 

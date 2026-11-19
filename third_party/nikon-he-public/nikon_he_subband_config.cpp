@@ -1,4 +1,5 @@
-/* WonderLantern modification, 2026-10-16: geometry, prediction mapping,
+/* nevtoraw modification, 2026-11-19: exact 5-level sub-band group counts.
+ * WonderLantern modification, 2026-10-16: geometry, prediction mapping,
  * lifetime/complete-frame/entropy bounds and defined signed arithmetic.
  * See runtime-source-receipt.json and the two patches in the parent folder.
  * Original copyright and dual-license notices follow unchanged. */
@@ -42,14 +43,22 @@ void compute_subband_layout(int half_pass_W, SubbandConfig out[26]) {
     int N_H5   = N4 - N5;
 
     // Per-sub-band ng for a 5-level lift LB (LBs 0, 1, 3).
-    // Each has 6 sub-bands with these group counts:
+    // Each has 6 sub-bands: LL5, H5, H4, H3, H2, H1. The 5/3 lift splits n
+    // samples into L = ceil(n/2), H = floor(n/2); a sub-band of s samples
+    // holds ceil(s/4) groups.
+    // nevtoraw, 2026-11-19: exact sizes. The original closed forms
+    // (ceil(ng_max/8) for H4 etc.) are off by one group for some widths,
+    // e.g. N-RAW UHD (3852 px wide: H4 has 120 samples = 30 groups, not 31).
+    (void)N_H5;
+    int H[6], L = half_pass_W;
+    for (int k = 1; k <= 5; k++) { H[k] = L / 2; L -= H[k]; }
     int ng_5level[6] = {
-        (N5     + 3) / 4,   // ceil(N5 / 4)
-        (N_H5   + 3) / 4,   // ceil(N_H5 / 4)
-        (ng_max + 7) / 8,   // ceil(ng_max / 8)
-        (ng_max + 3) / 4,   // ceil(ng_max / 4)
-        (ng_max + 1) / 2,   // ceil(ng_max / 2)
-        ng_max,
+        (L    + 3) / 4,     // LL5
+        (H[5] + 3) / 4,
+        (H[4] + 3) / 4,
+        (H[3] + 3) / 4,
+        (H[2] + 3) / 4,
+        (H[1] + 3) / 4,
     };
 
     // --- LB region sizes ---
