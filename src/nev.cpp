@@ -44,6 +44,15 @@ const MetaItem *Frame::find(uint16_t group, uint16_t tag) const {
     return nullptr;
 }
 
+unsigned black_level(const Frame &fr) {
+    const uint8_t *cs = fr.codestream();
+    size_t p = 2;
+    while (p + 4 < fr.cs_len && be16(cs + p) != 0xff12) p += be16(cs + p + 2) + 2u;
+    if (p + 41 > fr.cs_len) return 1008;
+    const uint8_t *t = cs + p + 28;
+    return ((t[3] & 15u) << 8) | t[4];
+}
+
 File::~File() { if (fp) fclose(fp); }
 
 bool File::open(const std::string &path, std::string &err) {

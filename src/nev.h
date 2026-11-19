@@ -25,6 +25,9 @@ struct Frame {
     const uint8_t *codestream() const { return data.data() + cs_off; }
 };
 
+// Black level from the codestream's picture-header vendor extension (1008 on the Z 8).
+unsigned black_level(const Frame &fr);
+
 struct File {
     FILE *fp = nullptr;
     uint64_t size = 0;

@@ -132,6 +132,7 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
 
     // ---- IFD0: raw image + camera/profile tags (no preview)
     Ifd &ifd0 = raw;
+    if (!opt.description.empty()) ifd0.add_ascii(0x010e, opt.description);
     ifd0.add_ascii(0x010f, mi.make);
     ifd0.add_ascii(0x0110, mi.model);
     ifd0.add_short(0x0112, {uint16_t(fi.orientation)});

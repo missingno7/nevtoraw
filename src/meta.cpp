@@ -35,8 +35,12 @@ MovieInfo movie_info(const File &f) {
         size_t n = size_t(type < 13 ? tsize[type] : 1) * cnt;
         if (p + 8 + n > d.size()) break;
         const uint8_t *v = &d[p + 8];
-        auto str = [&]() { std::string s(reinterpret_cast<const char *>(v), n); s = s.c_str();
-                           while (!s.empty() && s.back() == ' ') s.pop_back(); return s; };
+        auto str = [&]() {
+            std::string s(reinterpret_cast<const char *>(v), n);
+            s = s.c_str();
+            while (!s.empty() && s.back() == ' ') s.pop_back();
+            return s;
+        };
         switch (tag) {
         case 0x01: mi.make = str(); break;
         case 0x02: mi.model = str(); break;

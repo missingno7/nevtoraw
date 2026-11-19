@@ -15,6 +15,7 @@ struct DngOptions {
     unsigned threads = 0;
     unsigned white_level = 16383;
     unsigned black_level = 1008;
+    std::string description;  // ImageDescription, optional
 };
 
 // Build a DNG from a decoded frame (14-bit CFA samples, width x height).

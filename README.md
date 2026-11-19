@@ -4,11 +4,12 @@ Extracts frames of Nikon **N-RAW** video (`.NEV`, e.g. Z 8) as raw stills.
 
 ```
 nevtoraw [dng] <file.NEV> [-f 0 | 0-10 | 0,12,50 | 0-143:6 | all] [-o DIR] [-c ljpeg|none] [--white N]
+nevtoraw stack <file.NEV> [-f 0-15] [-r REF] [--no-align] [--tile 64] [-o DIR] [-c ljpeg|none]
 nevtoraw info  <file.NEV>
 ```
 
 `dng` is the default, so `nevtoraw clip.NEV -f all -o out` works. Without `-f` only frame 0 is
-exported.
+exported. `stack` averages frames (default 0-15) into one low-noise DNG.
 
 Build: `mingw32-make` (MSYS2 MinGW-w64 g++, C++17), producing one static `nevtoraw.exe`.
 The HE/TicoRAW decoder in `third_party/nikon-he-public` and `src/he_decode.cpp` come from
@@ -81,6 +82,41 @@ BlackLevel from the codestream, DefaultCrop (6,4) + the camera's output size, Fr
 * Other cameras: the matrices fall back to the frame's own matrix (single illuminant), which is
   untested.
 * White level 16383 is unverified: this clip has no clipped highlights.
+
+### Stacked DNG (`stack`)
+Aligns a burst of frames and averages them into one DNG that is still a raw mosaic, so Camera Raw
+demosaics it and its profiles and Denoise still apply. It follows the HDR+ approach and never
+demosaics:
+
+1. **Reference:** the middle frame of the list (`-r` to choose). Every frame is split into its four
+   CFA planes, black-subtracted and scaled to the reference exposure (ExposureTime × ISO / f²).
+2. **Align:** on a 2×2-binned grey image, with 64×64-sensor-px tiles and a 4-level pyramid search
+   (±8 px at the coarsest level, ±2 px below, parabolic sub-pixel fit at the finest). A 3×3 median
+   cleans the tile field, which is interpolated bilinearly per pixel. This handles handheld drift,
+   small rotation and rolling-shutter skew.
+3. **Warp:** each CFA plane is resampled separately (Catmull-Rom), so the colour pattern is kept.
+4. **Merge:** a robust weight per 2×2 quad compares the warped frame with the reference in a 3×3
+   low-passed grey image. The expected difference comes from a noise model fitted on the first
+   frame pair (`σ² = A·s + B`). The weight is 1 below 2.5σ and 0 above 4σ, then a 3×3 minimum
+   so motion edges drop out as a whole. Moving objects keep the reference frame's pixels (noisier,
+   no ghosts). Clipped samples are never merged.
+5. **Output:** the mean ×4 as 16-bit (BlackLevel 4032, WhiteLevel 65532), which keeps two extra
+   bits. ImageDescription records the frames and the reference.
+
+Measured on the 4.1K clip (G plane, flat areas, high-pass noise):
+
+| | noise (DN) | ideal 1/√N |
+| --- | --- | --- |
+| single frame | 42.6 | |
+| 16 frames aligned | 10.3 | 10.7 |
+| 64 frames aligned | 5.9 | 5.3 |
+
+The unaligned 64-frame average visibly smears small text and barcodes (about 10 px of drift);
+the aligned stacks stay as sharp as the single frame. On the 8.3K clip, 16 frames spread over
+2.3 s (up to 16 px handheld drift) align cleanly with no ghosting. Adobe DNG Converter reads the
+stacked DNG bit-identically. Cost: about 3 s for 16 4.1K frames; 12.5 s and 1.2 GB peak memory
+for 16 8.3K frames. These clips have no moving subjects, so the motion rejection is untested on
+real motion.
 
 ### NEF (not pursued)
 A frame's codestream placed unchanged into a Z 8 HE NEF opens in Adobe DNG Converter and decodes

@@ -119,7 +119,8 @@ std::vector<uint8_t> build(Ifd &ifd0, const std::vector<std::vector<uint8_t>> &b
         }
     std::vector<uint8_t> out;
     out.reserve(size_t(pos));
-    out.insert(out.end(), {'I', 'I', 42, 0});
+    put16(out, 0x4949);  // "II"
+    put16(out, 42);
     put32(out, 8);
     for (size_t k = 0; k < order.size(); k++) {
         Ifd &ifd = *order[k];
