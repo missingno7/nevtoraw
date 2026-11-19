@@ -157,15 +157,116 @@ double msd(const Img &r, const Img &f, int cx, int cy, int hw, int ox, int oy) {
     return s / (double(x1 - x0) * (y1 - y0));
 }
 
+// Whole-image translation (exhaustive search over +-rad on the central 80 %).
+void global_shift(const Img &r, const Img &f, int rad, int &gx, int &gy) {
+    const int x0 = r.w / 10, x1 = r.w - r.w / 10, y0 = r.h / 10, y1 = r.h - r.h / 10;
+    const int n = 2 * rad + 1;
+    std::vector<double> e(size_t(n) * n, INFINITY);
+    parallel_for(n * n, [&](int a, int b) {
+        for (int k = a; k < b; k++) {
+            int ox = k % n - rad, oy = k / n - rad;
+            int xa = std::max(x0, -ox), xb = std::min(x1, f.w - ox), ya = std::max(y0, -oy), yb = std::min(y1, f.h - oy);
+            if (xb - xa < (x1 - x0) / 2 || yb - ya < (y1 - y0) / 2) continue;
+            double s = 0;
+            for (int y = ya; y < yb; y++) {
+                const float *p = &r.d[size_t(y) * r.w], *q = &f.d[size_t(y + oy) * f.w + ox];
+                for (int x = xa; x < xb; x++) { float d = p[x] - q[x]; s += double(d) * d; }
+            }
+            e[size_t(k)] = s / (double(xb - xa) * (yb - ya));
+        }
+    });
+    size_t best = size_t(std::min_element(e.begin(), e.end()) - e.begin());
+    gx = int(best % size_t(n)) - rad; gy = int(best / size_t(n)) - rad;
+}
+
+// Replace tiles that disagree with their 5x5 neighbourhood median by more than thr.
+void reject_outliers(Field &F, float thr) {
+    std::vector<float> ox = F.dx, oy = F.dy;
+    for (int y = 0; y < F.ty; y++)
+        for (int x = 0; x < F.tx; x++) {
+            float nx[25], ny[25]; int k = 0;
+            for (int j = -2; j <= 2; j++)
+                for (int i = -2; i <= 2; i++) {
+                    int xx = x + i, yy = y + j;
+                    if (xx < 0 || yy < 0 || xx >= F.tx || yy >= F.ty) continue;
+                    nx[k] = F.dx[size_t(yy) * F.tx + xx]; ny[k] = F.dy[size_t(yy) * F.tx + xx]; k++;
+                }
+            std::nth_element(nx, nx + k / 2, nx + k); std::nth_element(ny, ny + k / 2, ny + k);
+            size_t o = size_t(y) * F.tx + x;
+            if (std::hypot(F.dx[o] - nx[k / 2], F.dy[o] - ny[k / 2]) > thr) { ox[o] = nx[k / 2]; oy[o] = ny[k / 2]; }
+        }
+    F.dx.swap(ox); F.dy.swap(oy);
+}
+
+// Camera motion as an affine field (translation, rotation, scale, shear: also covers most
+// rolling-shutter skew), fitted robustly (IRLS, Tukey) to the tile vectors. Tiles further
+// than max_dev from it (moving objects, mismatches) are replaced by the model.
+void clamp_to_affine(Field &F, float max_dev) {
+    const size_t n = F.dx.size();
+    std::vector<double> X(n), Y(n), w(n, 1.0);
+    for (size_t i = 0; i < n; i++) {
+        X[i] = ((double(i % size_t(F.tx)) + 0.5) / F.tx - 0.5) * 2;
+        Y[i] = ((double(i / size_t(F.tx)) + 0.5) / F.ty - 0.5) * 2;
+    }
+    double a[3] = {}, b[3] = {};
+    auto solve = [&]() {
+        double M[3][3] = {}, vx[3] = {}, vy[3] = {};
+        for (size_t i = 0; i < n; i++) {
+            double r[3] = {1, X[i], Y[i]};
+            for (int p = 0; p < 3; p++) {
+                for (int q = 0; q < 3; q++) M[p][q] += w[i] * r[p] * r[q];
+                vx[p] += w[i] * r[p] * F.dx[i]; vy[p] += w[i] * r[p] * F.dy[i];
+            }
+        }
+        // Gaussian elimination (3x3, two right-hand sides)
+        for (int c = 0; c < 3; c++) {
+            int piv = c;
+            for (int r = c + 1; r < 3; r++) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+            std::swap(M[c], M[piv]); std::swap(vx[c], vx[piv]); std::swap(vy[c], vy[piv]);
+            if (std::fabs(M[c][c]) < 1e-12) return false;
+            for (int r = 0; r < 3; r++) {
+                if (r == c) continue;
+                double f = M[r][c] / M[c][c];
+                for (int q = 0; q < 3; q++) M[r][q] -= f * M[c][q];
+                vx[r] -= f * vx[c]; vy[r] -= f * vy[c];
+            }
+        }
+        for (int c = 0; c < 3; c++) { a[c] = vx[c] / M[c][c]; b[c] = vy[c] / M[c][c]; }
+        return true;
+    };
+    const double c = std::max(2.0 * max_dev, 1.0);  // Tukey cut-off
+    for (int it = 0; it < 8; it++) {
+        if (!solve()) return;
+        for (size_t i = 0; i < n; i++) {
+            double r = std::hypot(F.dx[i] - (a[0] + a[1] * X[i] + a[2] * Y[i]), F.dy[i] - (b[0] + b[1] * X[i] + b[2] * Y[i]));
+            double u = r / c;
+            w[i] = u < 1 ? (1 - u * u) * (1 - u * u) : 0;
+        }
+    }
+    for (size_t i = 0; i < n; i++) {
+        double mx = a[0] + a[1] * X[i] + a[2] * Y[i], my = b[0] + b[1] * X[i] + b[2] * Y[i];
+        if (std::hypot(F.dx[i] - mx, F.dy[i] - my) > max_dev) { F.dx[i] = float(mx); F.dy[i] = float(my); }
+    }
+}
+
+// Coarse-to-fine tile alignment, regularised against moving objects: a global translation
+// seeds the coarsest level, each level searches only +-2 around its prior, and after every
+// level outliers go to their neighbourhood median and to the camera's affine motion.
 Field align(const std::vector<Img> &R, const std::vector<Img> &F, int T) {
     Field fd;
     fd.T = T;
     fd.tx = (R[0].w + T - 1) / T; fd.ty = (R[0].h + T - 1) / T;
     fd.dx.assign(size_t(fd.tx) * fd.ty, 0); fd.dy.assign(fd.dx.size(), 0);
     const int L = int(std::min(R.size(), F.size())) - 1;
+    {
+        int gx, gy;
+        global_shift(R[size_t(L)], F[size_t(L)], 16, gx, gy);
+        std::fill(fd.dx.begin(), fd.dx.end(), float(gx << L));
+        std::fill(fd.dy.begin(), fd.dy.end(), float(gy << L));
+    }
     for (int l = L; l >= 0; l--) {
         const int s = 1 << l;
-        const int radius = l == L ? 8 : 2;
+        const int radius = 2;
         const int hw = std::max(T / 2 / s, 8);
         std::vector<float> nx(fd.dx.size()), ny(fd.dy.size());
         parallel_for(fd.ty, [&](int t0, int t1) {
@@ -198,6 +299,8 @@ Field align(const std::vector<Img> &R, const std::vector<Img> &F, int T) {
                 }
         });
         fd.dx.swap(nx); fd.dy.swap(ny);
+        reject_outliers(fd, float(s));                       // 1 px at this level
+        clamp_to_affine(fd, std::max(1.5f, float(s)));       // plane px
         median3(fd);
     }
     return fd;
@@ -273,28 +376,62 @@ NoiseModel fit_noise(const Img &ref_lp, const Img &frm_lp, const std::vector<uin
         int b = std::min(NB - 1, int(std::sqrt(s / smax) * NB));
         bins[size_t(b)].push_back(std::fabs(frm_lp.d[i] - ref_lp.d[i]));
     }
-    // weighted least squares var = A*s + B over bins (robust sigma from the median)
-    double Sw = 0, Ss = 0, Sv = 0, Sss = 0, Ssv = 0;
+    // Per-bin robust variance (median absolute difference), then var = A*s + B by iteratively
+    // reweighted least squares: bins far above the line (moving objects or misalignment that
+    // dominate a brightness range) get weight 0, so they cannot inflate the model.
+    struct Bin { double s, var, n; };
+    std::vector<Bin> bv;
+    double total = 0;
     for (int b = 0; b < NB; b++) {
         auto &v = bins[size_t(b)];
         if (v.size() < 500) continue;
         std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
         double sig = 1.4826 * v[v.size() / 2];
-        double s = smax * std::pow((b + 0.5) / NB, 2);
-        double w = double(v.size());
-        Sw += w; Ss += w * s; Sv += w * sig * sig; Sss += w * s * s; Ssv += w * s * sig * sig;
+        bv.push_back({smax * std::pow((b + 0.5) / NB, 2), sig * sig, double(v.size())});
+        total += double(v.size());
     }
     NoiseModel m;
-    double det = Sw * Sss - Ss * Ss;
-    if (Sw > 0 && det > 0) {
-        m.A = (Sw * Ssv - Ss * Sv) / det;
-        m.B = (Sv - m.A * Ss) / Sw;
+    if (bv.size() < 2) return m;
+    std::vector<double> w(bv.size());
+    // start from the bins holding the darkest 70 % of the pixels (the bulk of the image)
+    double cum = 0;
+    for (size_t i = 0; i < bv.size(); i++) { w[i] = cum < 0.7 * total ? bv[i].n : 0; cum += bv[i].n; }
+    for (int it = 0; it < 8; it++) {
+        double Sw = 0, Ss = 0, Sv = 0, Sss = 0, Ssv = 0;
+        for (size_t i = 0; i < bv.size(); i++) {
+            Sw += w[i]; Ss += w[i] * bv[i].s; Sv += w[i] * bv[i].var;
+            Sss += w[i] * bv[i].s * bv[i].s; Ssv += w[i] * bv[i].s * bv[i].var;
+        }
+        double det = Sw * Sss - Ss * Ss;
+        if (Sw <= 0) break;
+        if (det > 1e-9 * Sw * Sss) { m.A = (Sw * Ssv - Ss * Sv) / det; m.B = (Sv - m.A * Ss) / Sw; }
+        else { m.A = 0; m.B = Sv / Sw; }
         if (m.A < 0) { m.A = 0; m.B = Sv / Sw; }
         m.B = std::max(m.B, 1.0);
         m.ok = true;
+        for (size_t i = 0; i < bv.size(); i++) {
+            double pred = m.A * bv[i].s + m.B, u = (bv[i].var - pred) / pred;  // relative excess
+            w[i] = std::fabs(u) < 1 ? bv[i].n * (1 - u * u) * (1 - u * u) : 0;
+        }
     }
     return m;
 }
+
+// Compact per-frame storage for median merging: 4 planes as uint16, value*2 + 4096
+// (0.5 DN steps, -2048..30719 DN); 0 marks a sample the frame does not cover.
+std::vector<uint16_t> encode(const Planes &P, const std::vector<uint8_t> *valid) {
+    const size_t plane = size_t(P.w) * P.h;
+    std::vector<uint16_t> s(4 * plane, 0);
+    parallel_for(P.h, [&](int y0, int y1) {
+        for (size_t o = size_t(y0) * P.w; o < size_t(y1) * P.w; o++) {
+            if (valid && !(*valid)[o]) continue;
+            for (int k = 0; k < 4; k++)
+                s[k * plane + o] = uint16_t(std::clamp(std::lround(P.p[k].d[o] * 2.0f) + 4096, 1L, 65535L));
+        }
+    });
+    return s;
+}
+inline float decode_sample(uint16_t u) { return (float(u) - 4096.0f) * 0.5f; }
 
 double exposure_scale(const FrameInfo &ref, const FrameInfo &f) {
     auto ev = [](const FrameInfo &i) {
@@ -332,6 +469,9 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
     // accumulators: start with the reference at weight 1 (clipped reference quads stay reference-only)
     Planes acc = R;
     Img wsum(R.w, R.h, 1.0f);
+    const bool median = opt.merge == StackMerge::Median;
+    std::vector<std::vector<uint16_t>> store;  // median: every aligned frame, reference first
+    if (median) store.push_back(encode(R, nullptr));
     NoiseModel nm;
     size_t used = 1;
     Planes F, Wp;
@@ -346,6 +486,11 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
         Field fd;
         if (opt.align) fd = align(rpyr, pyramid(grey(F)), int(opt.tile));
         warp(F, opt.align ? &fd : nullptr, Wp, valid);
+        double wtot = 0;
+        if (median) {
+            store.push_back(encode(Wp, &valid));
+            for (uint8_t v : valid) wtot += v;
+        } else {
         Img wlp = box3(grey(Wp));
         if (!nm.ok) {
             nm = fit_noise(rlp, wlp, valid);
@@ -377,7 +522,6 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
                     wm.at(x, y) = m;
                 }
         });
-        double wtot = 0;
         parallel_for(R.h, [&](int y0, int y1) {
             for (int y = y0; y < y1; y++)
                 for (int x = 0; x < R.w; x++) {
@@ -389,6 +533,7 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
                 }
         });
         for (float v : wm.d) wtot += v;
+        }
         used++;
         // report the median displacement and mean weight
         char b[160];
@@ -399,9 +544,33 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
             std::nth_element(ay.begin(), ay.begin() + long(ay.size() / 2), ay.end());
             mdx = 2 * ax[ax.size() / 2]; mdy = 2 * ay[ay.size() / 2];  // sensor pixels
         }
-        snprintf(b, sizeof b, "frame %4zu: shift %+6.1f %+6.1f px, exposure x%.3f, merged %5.1f %%", idx, mdx, mdy, sc,
-                 100.0 * wtot / double(wm.d.size()));
+        snprintf(b, sizeof b, "frame %4zu: shift %+6.1f %+6.1f px, exposure x%.3f, %s %5.1f %%", idx, mdx, mdy, sc,
+                 median ? "usable" : "merged", 100.0 * wtot / double(valid.size()));
         log(b);
+    }
+
+    if (median) {
+        // per-sample median over the frames that cover it (the reference always does)
+        parallel_for(R.h, [&](int y0, int y1) {
+            std::vector<float> v(store.size());
+            const size_t plane = size_t(R.w) * R.h;
+            for (int y = y0; y < y1; y++)
+                for (int x = 0; x < R.w; x++) {
+                    size_t o = size_t(y) * R.w + x;
+                    if (R.clip[o]) continue;  // clipped reference quad: keep the reference
+                    for (int k = 0; k < 4; k++) {
+                        size_t n = 0;
+                        for (auto &s : store)
+                            if (uint16_t u = s[k * plane + o]) v[n++] = decode_sample(u);
+                        auto mid = v.begin() + long(n / 2);
+                        std::nth_element(v.begin(), mid, v.begin() + long(n));
+                        float m = *mid;
+                        if (!(n & 1)) m = 0.5f * (m + *std::max_element(v.begin(), mid));
+                        acc.p[k].d[o] = m;
+                    }
+                    wsum.d[o] = 1;
+                }
+        });
     }
 
     // output: scaled 16-bit mosaic

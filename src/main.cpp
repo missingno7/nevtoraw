@@ -28,6 +28,8 @@ static void usage() {
             "      --white N       white level (default 16383)\n"
             "  stack only:\n"
             "  -r, --ref N         reference frame (default: middle of the list)\n"
+            "      --merge M       mean (default, robust weighted) | median (removes passing objects;\n"
+            "                      keeps all frames in memory, 2 bytes per sensor pixel each)\n"
             "      --no-align      average without alignment (tripod)\n"
             "      --tile N        alignment tile size in sensor pixels (default 64)\n");
 }
@@ -120,6 +122,12 @@ int main(int argc, char **argv) {
         } else if (a == "--white") opt.white_level = sopt.white = unsigned(atoi(next().c_str()));
         else if (stack && (a == "-r" || a == "--ref")) ref = atol(next().c_str());
         else if (stack && a == "--no-align") sopt.align = false;
+        else if (stack && a == "--merge") {
+            std::string m = next();
+            if (m == "mean") sopt.merge = nev::StackMerge::Mean;
+            else if (m == "median") sopt.merge = nev::StackMerge::Median;
+            else { usage(); return 2; }
+        }
         else if (stack && a == "--tile") {
             int t = atoi(next().c_str());
             if (t < 16 || t > 512 || (t & 1)) { fprintf(stderr, "--tile must be an even number 16..512\n"); return 2; }
@@ -140,8 +148,9 @@ int main(int argc, char **argv) {
         size_t r = ref >= 0 ? size_t(ref) : list[list.size() / 2];
         if (r >= f.frame_count()) { fprintf(stderr, "reference frame out of range\n"); return 2; }
         auto t0 = std::chrono::steady_clock::now();
-        printf("stacking %zu frames (%zu-%zu), reference %zu%s\n", list.size(), list.front(), list.back(), r,
-               sopt.align ? "" : ", no alignment");
+        const bool med = sopt.merge == nev::StackMerge::Median;
+        printf("%s-stacking %zu frames (%zu-%zu), reference %zu%s\n", med ? "median" : "mean", list.size(), list.front(),
+               list.back(), r, sopt.align ? "" : ", no alignment");
         nev::StackResult res;
         if (!nev::stack_frames(f, list, r, sopt, res, err, [](const std::string &s) { printf("  %s\n", s.c_str()); })) {
             fprintf(stderr, "%s\n", err.c_str()); return 1;
@@ -150,12 +159,12 @@ int main(int argc, char **argv) {
         opt.black_level = res.black;
         opt.white_level = res.white;
         char desc[160];
-        snprintf(desc, sizeof desc, "nevtoraw stack of %zu frames (%zu-%zu), reference %zu%s", res.frames_used,
-                 list.front(), list.back(), r, sopt.align ? "" : ", not aligned");
+        snprintf(desc, sizeof desc, "nevtoraw %s stack of %zu frames (%zu-%zu), reference %zu%s", med ? "median" : "mean",
+                 res.frames_used, list.front(), list.back(), r, sopt.align ? "" : ", not aligned");
         opt.description = desc;
         auto dng = nev::build_dng(res.px, res.width, res.height, mi, fi, r, in.filename().string(), opt);
         char name[64];
-        snprintf(name, sizeof name, "_stack_%05zu-%05zu.dng", list.front(), list.back());
+        snprintf(name, sizeof name, "_%s_%05zu-%05zu.dng", med ? "median" : "stack", list.front(), list.back());
         fs::path out = dir / (stem + name);
         if (!write_file(out, dng)) return 1;
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

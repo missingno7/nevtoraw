@@ -13,13 +13,19 @@
 
 namespace nev {
 
+enum class StackMerge {
+    Mean,    // robust weighted mean (motion falls back to the reference)
+    Median,  // per-sample median of all aligned frames (removes transients; keeps every frame in memory)
+};
+
 struct StackOptions {
+    StackMerge merge = StackMerge::Mean;
     bool align = true;
     unsigned tile = 32;          // tile size in Bayer-plane pixels (= 2 sensor px)
     unsigned out_scale = 4;      // output = black*scale + mean*scale (2 extra bits)
     unsigned white = 16383;      // input white level (clipping threshold is derived)
     unsigned threads = 0;
-    float z_lo = 2.5f, z_hi = 4.0f;  // robust weight: 1 below z_lo, 0 above z_hi
+    float z_lo = 3.0f, z_hi = 5.0f;  // robust weight: 1 below z_lo, 0 above z_hi
 };
 
 struct StackResult {
