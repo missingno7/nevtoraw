@@ -28,8 +28,10 @@ static void usage() {
             "      --white N       white level (default 16383)\n"
             "  stack only:\n"
             "  -r, --ref N         reference frame (default: middle of the list)\n"
-            "      --merge M       mean (default, robust weighted) | median (removes passing objects;\n"
-            "                      keeps all frames in memory, 2 bytes per sensor pixel each)\n"
+            "      --merge M       mean (default, robust weighted) | median | trimmed-mean\n"
+            "                      median and trimmed-mean store 2 bytes per sensor pixel per frame\n"
+            "      --trim-percent N  discard N%% from each tail in trimmed-mean (0..49, default 20)\n"
+            "      --align MODE    tiles (default) or homography (global perspective)\n"
             "      --no-align      average without alignment (tripod)\n"
             "      --tile N        alignment tile size in sensor pixels (default 64)\n");
 }
@@ -109,6 +111,7 @@ int main(int argc, char **argv) {
     long ref = -1;
     nev::DngOptions opt;
     nev::StackOptions sopt;
+    bool trim_given = false;
     for (int i = first; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
@@ -121,18 +124,38 @@ int main(int argc, char **argv) {
             else { usage(); return 2; }
         } else if (a == "--white") opt.white_level = sopt.white = unsigned(atoi(next().c_str()));
         else if (stack && (a == "-r" || a == "--ref")) ref = atol(next().c_str());
-        else if (stack && a == "--no-align") sopt.align = false;
-        else if (stack && a == "--merge") {
+        else if (stack && a == "--no-align") sopt.alignment = nev::StackAlignment::None;
+        else if (stack && a == "--align") {
+            std::string mode = next();
+            if (mode == "tiles") sopt.alignment = nev::StackAlignment::Tiles;
+            else if (mode == "homography") sopt.alignment = nev::StackAlignment::Homography;
+            else { usage(); return 2; }
+        } else if (stack && a == "--merge") {
             std::string m = next();
             if (m == "mean") sopt.merge = nev::StackMerge::Mean;
             else if (m == "median") sopt.merge = nev::StackMerge::Median;
+            else if (m == "trimmed-mean") sopt.merge = nev::StackMerge::TrimmedMean;
             else { usage(); return 2; }
-        }
-        else if (stack && a == "--tile") {
+        } else if (stack && a == "--trim-percent") {
+            std::string value = next();
+            char *end;
+            long percent = strtol(value.c_str(), &end, 10);
+            if (value.empty() || *end || percent < 0 || percent > 49) {
+                fprintf(stderr, "--trim-percent must be an integer from 0 to 49\n");
+                return 2;
+            }
+            sopt.trim_percent = unsigned(percent);
+            trim_given = true;
+        } else if (stack && a == "--tile") {
             int t = atoi(next().c_str());
             if (t < 16 || t > 512 || (t & 1)) { fprintf(stderr, "--tile must be an even number 16..512\n"); return 2; }
             sopt.tile = unsigned(t / 2);
         } else { usage(); return 2; }
+    }
+    const bool trimmed = sopt.merge == nev::StackMerge::TrimmedMean;
+    if (trim_given && !trimmed) {
+        fprintf(stderr, "--trim-percent requires --merge trimmed-mean\n");
+        return 2;
     }
     nev::File f; std::string err;
     if (!f.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
@@ -149,8 +172,13 @@ int main(int argc, char **argv) {
         if (r >= f.frame_count()) { fprintf(stderr, "reference frame out of range\n"); return 2; }
         auto t0 = std::chrono::steady_clock::now();
         const bool med = sopt.merge == nev::StackMerge::Median;
-        printf("%s-stacking %zu frames (%zu-%zu), reference %zu%s\n", med ? "median" : "mean", list.size(), list.front(),
-               list.back(), r, sopt.align ? "" : ", no alignment");
+        const char *merge = trimmed ? "trimmed mean" : med ? "median" : "mean";
+        const std::string trim = trimmed ? ", trim " + std::to_string(sopt.trim_percent) + "% per tail" : "";
+        const bool unaligned = sopt.alignment == nev::StackAlignment::None;
+        const bool projective = sopt.alignment == nev::StackAlignment::Homography;
+        const char *alignment = projective ? ", homography alignment" : "";
+        printf("%s-stacking %zu frames (%zu-%zu), reference %zu%s%s\n", merge, list.size(), list.front(),
+               list.back(), r, unaligned ? ", no alignment" : alignment, trim.c_str());
         nev::StackResult res;
         if (!nev::stack_frames(f, list, r, sopt, res, err, [](const std::string &s) { printf("  %s\n", s.c_str()); })) {
             fprintf(stderr, "%s\n", err.c_str()); return 1;
@@ -159,12 +187,13 @@ int main(int argc, char **argv) {
         opt.black_level = res.black;
         opt.white_level = res.white;
         char desc[160];
-        snprintf(desc, sizeof desc, "nevtoraw %s stack of %zu frames (%zu-%zu), reference %zu%s", med ? "median" : "mean",
-                 res.frames_used, list.front(), list.back(), r, sopt.align ? "" : ", not aligned");
+        snprintf(desc, sizeof desc, "nevtoraw %s stack of %zu frames (%zu-%zu), reference %zu%s%s", merge,
+                 res.frames_used, list.front(), list.back(), r, unaligned ? ", not aligned" : alignment, trim.c_str());
         opt.description = desc;
         auto dng = nev::build_dng(res.px, res.width, res.height, mi, fi, r, in.filename().string(), opt);
         char name[64];
-        snprintf(name, sizeof name, "_%s_%05zu-%05zu.dng", med ? "median" : "stack", list.front(), list.back());
+        const std::string suffix = trimmed ? "trimmed" + std::to_string(sopt.trim_percent) : med ? "median" : "stack";
+        snprintf(name, sizeof name, "_%s_%05zu-%05zu.dng", suffix.c_str(), list.front(), list.back());
         fs::path out = dir / (stem + name);
         if (!write_file(out, dng)) return 1;
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

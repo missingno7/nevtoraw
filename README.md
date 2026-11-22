@@ -4,7 +4,7 @@ Extracts frames of Nikon **N-RAW** video (`.NEV`, e.g. Z 8) as raw stills.
 
 ```
 nevtoraw [dng] <file.NEV> [-f 0 | 0-10 | 0,12,50 | 0-143:6 | all] [-o DIR] [-c ljpeg|none] [--white N]
-nevtoraw stack <file.NEV> [-f 0-15] [--merge mean|median] [-r REF] [--no-align] [--tile 64] [-o DIR] [-c ljpeg|none]
+nevtoraw stack <file.NEV> [-f 0-15] [--merge mean|median|trimmed-mean] [--trim-percent 20] [-r REF] [--align tiles|homography | --no-align] [--tile 64] [-o DIR] [-c ljpeg|none]
 nevtoraw info  <file.NEV>
 ```
 
@@ -88,6 +88,13 @@ Aligns a burst of frames and averages them into one DNG that is still a raw mosa
 demosaics it and its profiles and Denoise still apply. It follows the HDR+ approach and never
 demosaics:
 
+For handheld shots of a mostly stationary scene, try a global perspective warp with a trimmed mean.
+This example takes nine evenly spaced frames from a 273-frame clip.
+
+```
+nevtoraw stack clip.NEV -f 0-272:34 --align homography --merge trimmed-mean --trim-percent 20 -o out
+```
+
 1. **Reference:** the middle frame of the list (`-r` to choose). Every frame is split into its four
    CFA planes, black-subtracted and scaled to the reference exposure (ExposureTime × ISO / f²).
 2. **Align:** on a 2×2-binned grey image, with 64×64-sensor-px tiles and a 4-level pyramid. The
@@ -97,8 +104,14 @@ demosaics:
    affine model of the camera motion (translation, rotation, scale, shear, which covers most
    rolling-shutter skew) is fitted robustly (IRLS, Tukey). Tiles more than 1.5 px from that model
    are set to it, so a moving object cannot drag the background with it. The tile field is
-   interpolated bilinearly per pixel.
+   interpolated bilinearly per pixel in `tiles` mode (the default).
+
+   In `homography` mode the tile field seeds the search for matching control points. A robust fit
+   estimates one perspective transform per frame, including pan and rotation. Frames with too few
+   reliable, widely spread matches are skipped. Strong foreground parallax can still leave local
+   misalignment.
 3. **Warp:** each CFA plane is resampled separately (Catmull-Rom), so the colour pattern is kept.
+   Where a warped frame runs out of coverage, only the frames that cover the pixel contribute.
 4. **Merge** (`--merge`):
    * `mean` (default): a robust weight per 2×2 quad compares the warped frame with the reference
      in a 3×3 low-passed grey image. The expected difference comes from a noise model
@@ -108,12 +121,17 @@ demosaics:
      reference frame (sharp, single-frame noise) and is removed from all other frames: no ghosts.
    * `median`: per-sample median of every aligned frame that covers the sample. Anything present
      in fewer than half the frames disappears, including from the reference (people walking
-     through, cars). It needs every frame in memory (2 bytes per sensor pixel each).
+     through, cars).
+   * `trimmed-mean`: at each Bayer site, drop the lowest and highest `--trim-percent` percent of
+     valid samples and average the rest. The default of 20 averages the middle 60% when the sample
+     count permits it. The number removed from each tail is rounded down. A larger trim rejects
+     more outliers and leaves fewer samples to average. Both `median` and `trimmed-mean` store
+     every aligned frame in memory (2 bytes per sensor pixel per frame).
 
    Clipped samples are never merged.
 5. **Output:** the result ×4 as 16-bit (BlackLevel 4032, WhiteLevel 65532), which keeps two extra
    bits. ImageDescription records the mode, the frames and the reference. Files are named
-   `_stack_` (mean) or `_median_`.
+   `_stack_` (mean), `_median_`, or e.g. `_trimmed20_` for a 20% trim per tail.
 
 Measured on the 4.1K clip (G plane, flat areas, high-pass noise; the single frame here is 40.5 DN):
 

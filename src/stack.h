@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Burst stacking in the Bayer domain: align frames on a 2x2-binned grey image
-// with a tile-based coarse-to-fine search, resample each CFA plane separately
-// (sub-pixel, Catmull-Rom) and merge with per-quad robust weights. The CFA
-// layout is kept, so the result is still a mosaic raw.
+// Burst stacking in the Bayer domain: estimate motion on a 2x2-binned grey
+// image, resample each CFA plane separately (Catmull-Rom), then merge into
+// a mosaic raw.
 #pragma once
 #include "nev.h"
 
@@ -14,13 +13,17 @@
 namespace nev {
 
 enum class StackMerge {
-    Mean,    // robust weighted mean (motion falls back to the reference)
-    Median,  // per-sample median of all aligned frames (removes transients; keeps every frame in memory)
+    Mean,        // robust weighted mean (motion falls back to the reference)
+    Median,      // per-sample median of all aligned frames
+    TrimmedMean, // per-sample average after trimming both tails
 };
+
+enum class StackAlignment { None, Tiles, Homography };
 
 struct StackOptions {
     StackMerge merge = StackMerge::Mean;
-    bool align = true;
+    unsigned trim_percent = 20; // percentage removed from each tail in TrimmedMean
+    StackAlignment alignment = StackAlignment::Tiles;
     unsigned tile = 32;          // tile size in Bayer-plane pixels (= 2 sensor px)
     unsigned out_scale = 4;      // output = black*scale + mean*scale (2 extra bits)
     unsigned white = 16383;      // input white level (clipping threshold is derived)

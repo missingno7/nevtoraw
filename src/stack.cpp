@@ -5,9 +5,12 @@
 #include "meta.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <numeric>
+#include <random>
 #include <thread>
 
 namespace nev {
@@ -261,8 +264,8 @@ Field align(const std::vector<Img> &R, const std::vector<Img> &F, int T) {
     {
         int gx, gy;
         global_shift(R[size_t(L)], F[size_t(L)], 16, gx, gy);
-        std::fill(fd.dx.begin(), fd.dx.end(), float(gx << L));
-        std::fill(fd.dy.begin(), fd.dy.end(), float(gy << L));
+        std::fill(fd.dx.begin(), fd.dx.end(), float(gx * (1 << L)));
+        std::fill(fd.dy.begin(), fd.dy.end(), float(gy * (1 << L)));
     }
     for (int l = L; l >= 0; l--) {
         const int s = 1 << l;
@@ -306,6 +309,228 @@ Field align(const std::vector<Img> &R, const std::vector<Img> &F, int T) {
     return fd;
 }
 
+struct ControlImage {
+    Img fine, coarse;
+};
+
+ControlImage control_image(Img grey) {
+    // Compress bright features and suppress noise for matching only.
+    for (float &v : grey.d) v = std::sqrt(std::max(v + 20.0f, 1.0f));
+    Img fine = box3(grey);
+    Img coarse = down2(fine);
+    return {std::move(fine), std::move(coarse)};
+}
+
+struct ControlPoint { int x, y; };
+
+std::vector<ControlPoint> control_points(const Img &image) {
+    const int cell = 88, margin = 24;
+    std::vector<ControlPoint> points;
+    for (int top = margin; top < image.h - margin; top += cell)
+        for (int left = margin; left < image.w - margin; left += cell) {
+            ControlPoint best{};
+            double strength = 0.24;
+            for (int y = top; y < std::min(top + cell, image.h - margin); y += 7)
+                for (int x = left; x < std::min(left + cell, image.w - margin); x += 7) {
+                    double xx = 0, xy = 0, yy = 0;
+                    for (int j = -8; j <= 8; j += 2)
+                        for (int i = -8; i <= 8; i += 2) {
+                            double gx = 0.5 * (image.at(x + i + 1, y + j) - image.at(x + i - 1, y + j));
+                            double gy = 0.5 * (image.at(x + i, y + j + 1) - image.at(x + i, y + j - 1));
+                            xx += gx * gx; xy += gx * gy; yy += gy * gy;
+                        }
+                    // The smaller gradient eigenvalue selects features that constrain both axes.
+                    const double score = (xx + yy - std::hypot(xx - yy, 2 * xy)) / (2 * 81);
+                    if (score > strength) { strength = score; best = {x, y}; }
+                }
+            if (best.x) points.push_back(best);
+        }
+    return points;
+}
+
+struct Patch {
+    const Img &image;
+    int x, y, radius;
+    double sum = 0, variance = 0;
+
+    Patch(const Img &image, int x, int y, int radius) : image(image), x(x), y(y), radius(radius) {
+        double square_sum = 0;
+        for (int j = -radius; j <= radius; ++j)
+            for (int i = -radius; i <= radius; ++i) {
+                double v = image.at(x + i, y + j);
+                sum += v; square_sum += v * v;
+            }
+        variance = square_sum - sum * sum / count();
+    }
+
+    int count() const { return (2 * radius + 1) * (2 * radius + 1); }
+
+    double correlation(const Img &other, int ox, int oy) const {
+        if (ox - radius < 0 || oy - radius < 0 || ox + radius >= other.w || oy + radius >= other.h)
+            return -1;
+        double other_sum = 0, other_square_sum = 0, product_sum = 0;
+        for (int j = -radius; j <= radius; ++j) {
+            const float *a = &image.d[size_t(y + j) * image.w + x];
+            const float *b = &other.d[size_t(oy + j) * other.w + ox];
+            for (int i = -radius; i <= radius; ++i) {
+                double v = b[i];
+                other_sum += v; other_square_sum += v * v; product_sum += a[i] * v;
+            }
+        }
+        double other_variance = other_square_sum - other_sum * other_sum / count();
+        if (variance < 1e-8 || other_variance < 1e-8) return -1;
+        return (product_sum - sum * other_sum / count()) / std::sqrt(variance * other_variance);
+    }
+};
+
+struct Peak { int x, y; double score, sub_x = 0, sub_y = 0; };
+
+Peak match_patch(const Patch &patch, const Img &image, int cx, int cy, int radius, bool subpixel) {
+    Peak best{cx, cy, -1};
+    for (int y = cy - radius; y <= cy + radius; ++y)
+        for (int x = cx - radius; x <= cx + radius; ++x) {
+            double score = patch.correlation(image, x, y);
+            if (score > best.score) best = {x, y, score};
+        }
+    if (subpixel && best.score > 0) {
+        auto offset = [&](double left, double right) {
+            double curvature = left + right - 2 * best.score;
+            return left > -1 && right > -1 && curvature < 0
+                       ? std::clamp(0.5 * (left - right) / curvature, -0.5, 0.5) : 0.0;
+        };
+        auto score = [&](int dx, int dy) { return patch.correlation(image, best.x + dx, best.y + dy); };
+        best.sub_x = offset(score(-1, 0), score(1, 0));
+        best.sub_y = offset(score(0, -1), score(0, 1));
+    }
+    return best;
+}
+
+struct Match { double x = 0, y = 0, dx = 0, dy = 0; bool valid = false; };
+
+std::vector<Match> match_controls(const ControlImage &ref, const ControlImage &frame, const Field &prior,
+                                  const std::vector<ControlPoint> &points) {
+    std::vector<Match> matches(points.size());
+    parallel_for(int(points.size()), [&](int start, int end) {
+        for (int i = start; i < end; ++i) {
+            auto [x, y] = points[size_t(i)];
+            float dx, dy;
+            prior.bilinear(float(x), float(y), dx, dy);
+            auto coarse = match_patch(Patch(ref.coarse, x / 2, y / 2, 10), frame.coarse,
+                                      x / 2 + int(std::lround(dx / 2)), y / 2 + int(std::lround(dy / 2)), 14, false);
+            if (coarse.score < 0.72) continue;
+            auto fine = match_patch(Patch(ref.fine, x, y, 16), frame.fine,
+                                    2 * coarse.x + (x & 1), 2 * coarse.y + (y & 1), 3, true);
+            if (fine.score < 0.86) continue;
+            // Require forward/backward agreement to reject ambiguous and occluded matches.
+            auto back = match_patch(Patch(frame.fine, fine.x, fine.y, 16), ref.fine, x, y, 4, true);
+            if (back.score < 0.85 || std::hypot(back.x - x + back.sub_x + fine.sub_x,
+                                              back.y - y + back.sub_y + fine.sub_y) > 0.55) continue;
+            matches[size_t(i)] = {double(x), double(y), fine.x - x + fine.sub_x, fine.y - y + fine.sub_y, true};
+        }
+    });
+    matches.erase(std::remove_if(matches.begin(), matches.end(), [](const Match &m) { return !m.valid; }), matches.end());
+    return matches;
+}
+
+// Inverse warp (reference to source) in CFA-plane coordinates. The fit uses centred,
+// scaled coordinates and models displacement so the solution is well conditioned.
+struct Homography {
+    double cx = 0, cy = 0, scale = 1;
+    std::array<double, 8> a{};
+
+    double denominator(double x, double y) const {
+        return 1 + (a[6] * (x - cx) + a[7] * (y - cy)) / (scale * scale);
+    }
+
+    void displacement(double x, double y, double &dx, double &dy) const {
+        const double u = (x - cx) / scale, v = (y - cy) / scale;
+        const double t = a[6] * u + a[7] * v, w = 1 + t / scale;
+        dx = (a[0] + a[2] * u + a[3] * v - t * u) / w;
+        dy = (a[1] + a[4] * u + a[5] * v - t * v) / w;
+    }
+
+    double error_squared(const Match &m) const {
+        double dx, dy;
+        displacement(m.x, m.y, dx, dy);
+        dx -= m.dx; dy -= m.dy;
+        return dx * dx + dy * dy;
+    }
+};
+
+bool solve_homography(Homography &h, const std::vector<Match> &matches, const std::vector<double> &weights) {
+    double matrix[8][9] = {};
+    for (size_t i = 0; i < matches.size(); ++i) {
+        if (weights[i] == 0) continue;
+        const auto &m = matches[i];
+        const double x = (m.x - h.cx) / h.scale, y = (m.y - h.cy) / h.scale;
+        const double u = x + m.dx / h.scale, v = y + m.dy / h.scale;
+        const double rows[2][9] = {
+            {1, 0, x, y, 0, 0, -u * x, -u * y, m.dx},
+            {0, 1, 0, 0, x, y, -v * x, -v * y, m.dy},
+        };
+        for (const auto &row : rows)
+            for (int r = 0; r < 8; ++r)
+                for (int c = 0; c < 9; ++c)
+                    matrix[r][c] += weights[i] * row[r] * row[c];
+    }
+    for (int c = 0; c < 8; ++c) {
+        int pivot = c;
+        for (int r = c + 1; r < 8; ++r)
+            if (std::abs(matrix[r][c]) > std::abs(matrix[pivot][c])) pivot = r;
+        if (std::abs(matrix[pivot][c]) < 1e-9) return false;
+        std::swap(matrix[c], matrix[pivot]);
+        for (int r = 0; r < 8; ++r) {
+            if (r == c) continue;
+            double factor = matrix[r][c] / matrix[c][c];
+            for (int j = c; j < 9; ++j) matrix[r][j] -= factor * matrix[c][j];
+        }
+    }
+    for (int i = 0; i < 8; ++i) h.a[i] = matrix[i][8] / matrix[i][i];
+    return true;
+}
+
+bool fit_homography(const std::vector<Match> &matches, int width, int height, Homography &h, size_t &inliers) {
+    constexpr size_t min_inliers = 12;
+    constexpr double cutoff = 1.75 * 1.75;  // squared plane pixels
+    if (matches.size() < min_inliers) return false;
+    h = {(width - 1) * 0.5, (height - 1) * 0.5, std::max(width, height) * 0.5};
+    std::vector<double> weights(matches.size());
+    std::mt19937 rng(151);
+    double best_loss = INFINITY;
+    for (int trial = 0; trial < 300; ++trial) {
+        Homography candidate = h;
+        std::fill(weights.begin(), weights.end(), 0);
+        for (int n = 0; n < 6; ++n) weights[rng() % matches.size()] = 1;
+        if (!solve_homography(candidate, matches, weights)) continue;
+        double loss = 0;
+        for (const auto &m : matches) loss += std::min(cutoff, candidate.error_squared(m));
+        if (loss < best_loss) { h = candidate; best_loss = loss; }
+    }
+    if (!std::isfinite(best_loss)) return false;
+    for (double radius : {4.0, 3.0, 2.5, 2.0, 2.0, 2.0}) {
+        for (size_t i = 0; i < matches.size(); ++i) {
+            double e = h.error_squared(matches[i]) / (radius * radius);
+            weights[i] = e < 1 ? (1 - e) * (1 - e) : 0;
+        }
+        if (!solve_homography(h, matches, weights)) break;
+    }
+    int left = width, right = 0, top = height, bottom = 0;
+    for (const auto &m : matches) {
+        if (!(h.error_squared(m) <= cutoff)) continue;
+        ++inliers;
+        left = std::min(left, int(m.x)); right = std::max(right, int(m.x));
+        top = std::min(top, int(m.y)); bottom = std::max(bottom, int(m.y));
+    }
+    if (inliers < min_inliers || inliers * 2 < matches.size() ||
+        right - left < width / 4 || bottom - top < height / 5) return false;
+    // The denominator is linear over the image. Require it to stay clear of zero
+    // throughout the footprint so the warp has no pole inside the frame.
+    for (int y : {0, height - 1})
+        for (int x : {0, width - 1})
+            if (!(h.denominator(x, y) > 0.1)) return false;
+    return true;
+}
+
 inline void catmull(float t, float w[4]) {
     float t2 = t * t, t3 = t2 * t;
     w[0] = 0.5f * (-t3 + 2 * t2 - t);
@@ -314,9 +539,33 @@ inline void catmull(float t, float w[4]) {
     w[3] = 0.5f * (t3 - t2);
 }
 
-// Resample all four planes of `src` through the field into `dst`; `valid` marks quads
-// whose source footprint is inside the frame and not clipped.
-void warp(const Planes &src, const Field *fd, Planes &dst, std::vector<uint8_t> &valid) {
+struct Footprint {
+    int x, y;
+    float wx[4], wy[4];
+};
+
+bool make_footprint(const Planes &src, float x, float y, Footprint &f) {
+    f.x = int(std::floor(x)); f.y = int(std::floor(y));
+    if (f.x < 1 || f.y < 1 || f.x + 2 >= src.w || f.y + 2 >= src.h) return false;
+    catmull(x - f.x, f.wx); catmull(y - f.y, f.wy);
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i)
+            if (f.wx[i] != 0 && f.wy[j] != 0 && src.clip[size_t(f.y - 1 + j) * src.w + f.x - 1 + i])
+                return false;
+    return true;
+}
+
+float interpolate(const Img &img, const Footprint &f) {
+    float acc = 0;
+    for (int j = 0; j < 4; ++j) {
+        const float *r = &img.d[size_t(f.y - 1 + j) * img.w + f.x - 1];
+        acc += f.wy[j] * (f.wx[0] * r[0] + f.wx[1] * r[1] + f.wx[2] * r[2] + f.wx[3] * r[3]);
+    }
+    return acc;
+}
+
+// Resample the four planes separately; valid marks quads with an unclipped footprint.
+void warp(const Planes &src, const Field *fd, const Homography *h, Planes &dst, std::vector<uint8_t> &valid) {
     dst.w = src.w; dst.h = src.h;
     for (auto &i : dst.p) if (i.w != src.w || i.h != src.h) i = Img(src.w, src.h);
     valid.assign(size_t(src.w) * src.h, 0);
@@ -325,31 +574,29 @@ void warp(const Planes &src, const Field *fd, Planes &dst, std::vector<uint8_t> 
         for (int y = y0; y < y1; y++)
             for (int x = 0; x < src.w; x++) {
                 size_t o = size_t(y) * src.w + x;
-                if (!fd) {
+                if (h) {
+                    Footprint sites[4];
+                    bool inside = true;
+                    for (int k = 0; k < 4 && inside; ++k) {
+                        // Matching coordinates refer to the centre of the Bayer quad.
+                        // Evaluate the transform at each site's own position in that quad.
+                        double dx, dy;
+                        h->displacement(x + ((k & 1) ? 0.25 : -0.25),
+                                        y + ((k & 2) ? 0.25 : -0.25), dx, dy);
+                        inside = make_footprint(src, float(x + dx), float(y + dy), sites[k]);
+                    }
+                    if (!inside) continue;
+                    for (int k = 0; k < 4; ++k) dst.p[k].d[o] = interpolate(src.p[k], sites[k]);
+                } else if (fd) {
+                    float dx, dy;
+                    fd->bilinear(float(x), float(y), dx, dy);
+                    Footprint footprint;
+                    if (!make_footprint(src, x + dx, y + dy, footprint)) continue;
+                    for (int k = 0; k < 4; ++k) dst.p[k].d[o] = interpolate(src.p[k], footprint);
+                } else {
                     for (int k = 0; k < 4; k++) dst.p[k].d[o] = src.p[k].d[o];
                     valid[o] = !src.clip[o];
                     continue;
-                }
-                float dx, dy;
-                fd->bilinear(float(x), float(y), dx, dy);
-                float sx = x + dx, sy = y + dy;
-                int ix = int(std::floor(sx)), iy = int(std::floor(sy));
-                if (ix < 1 || iy < 1 || ix + 2 >= src.w || iy + 2 >= src.h) continue;
-                float wx[4], wy[4];
-                catmull(sx - ix, wx); catmull(sy - iy, wy);
-                bool clip = false;
-                for (int j = 0; j < 4; j++)
-                    for (int i = 0; i < 4; i++)
-                        if ((wx[i] != 0 && wy[j] != 0) && src.clip[size_t(iy - 1 + j) * src.w + ix - 1 + i]) clip = true;
-                if (clip) continue;
-                for (int k = 0; k < 4; k++) {
-                    const Img &s = src.p[k];
-                    float acc = 0;
-                    for (int j = 0; j < 4; j++) {
-                        const float *r = &s.d[size_t(iy - 1 + j) * s.w + ix - 1];
-                        acc += wy[j] * (wx[0] * r[0] + wx[1] * r[1] + wx[2] * r[2] + wx[3] * r[3]);
-                    }
-                    dst.p[k].d[o] = acc;
                 }
                 valid[o] = 1;
             }
@@ -417,7 +664,7 @@ NoiseModel fit_noise(const Img &ref_lp, const Img &frm_lp, const std::vector<uin
     return m;
 }
 
-// Compact per-frame storage for median merging: 4 planes as uint16, value*2 + 4096
+// Compact per-frame storage for per-sample merging: 4 planes as uint16, value*2 + 4096
 // (0.5 DN steps, -2048..30719 DN); 0 marks a sample the frame does not cover.
 std::vector<uint16_t> encode(const Planes &P, const std::vector<uint8_t> *valid) {
     const size_t plane = size_t(P.w) * P.h;
@@ -433,6 +680,17 @@ std::vector<uint16_t> encode(const Planes &P, const std::vector<uint8_t> *valid)
 }
 inline float decode_sample(uint16_t u) { return (float(u) - 4096.0f) * 0.5f; }
 
+float trimmed_mean(uint16_t *begin, uint16_t *end, unsigned percent) {
+    const auto trim = (end - begin) * percent / 100;
+    auto *low = begin + trim, *high = end - trim;
+    if (trim) {
+        std::nth_element(begin, low, end);
+        std::nth_element(low, high, end);
+    }
+    const auto sum = std::accumulate(low, high, uint64_t{0});
+    return float((double(sum) / (high - low) - 4096.0) * 0.5);
+}
+
 double exposure_scale(const FrameInfo &ref, const FrameInfo &f) {
     auto ev = [](const FrameInfo &i) {
         double t = i.exposure > 0 ? i.exposure : 1, n = i.fnumber > 0 ? i.fnumber : 1, s = i.iso ? i.iso : 100;
@@ -446,6 +704,9 @@ double exposure_scale(const FrameInfo &ref, const FrameInfo &f) {
 
 bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, const StackOptions &opt,
                   StackResult &out, std::string &err, const StackLog &log) {
+    const bool trimmed = opt.merge == StackMerge::TrimmedMean;
+    if (trimmed && opt.trim_percent > 49) { err = "trim percentage must be 0..49"; return false; }
+    const bool per_sample = opt.merge != StackMerge::Mean;
     g_threads = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
     auto decode = [&](size_t idx, Frame &fr, std::vector<uint16_t> &raw) {
         if (!f.read_frame(idx, fr, err)) return false;
@@ -460,18 +721,21 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
     const float black = float(black_level(rf));
     const unsigned clip_level = opt.white > 512 ? opt.white - 256 : opt.white;
     const FrameInfo ref_info = frame_info(rf);
+    const bool aligned = opt.alignment != StackAlignment::None;
+    const bool projective = opt.alignment == StackAlignment::Homography;
 
     Planes R = split(raw, W, H, black, 1.0f, clip_level);
     Img rg = grey(R);
-    std::vector<Img> rpyr = opt.align ? pyramid(rg) : std::vector<Img>{};
-    Img rlp = box3(rg);
+    auto rpyr = aligned ? pyramid(rg) : std::vector<Img>{};
+    ControlImage ref_control = projective ? control_image(rg) : ControlImage{};
+    auto points = projective ? control_points(ref_control.fine) : std::vector<ControlPoint>{};
+    Img rlp = per_sample ? Img{} : box3(rg);
 
     // accumulators: start with the reference at weight 1 (clipped reference quads stay reference-only)
     Planes acc = R;
     Img wsum(R.w, R.h, 1.0f);
-    const bool median = opt.merge == StackMerge::Median;
-    std::vector<std::vector<uint16_t>> store;  // median: every aligned frame, reference first
-    if (median) store.push_back(encode(R, nullptr));
+    std::vector<std::vector<uint16_t>> store; // every aligned frame, reference first
+    if (per_sample) store.push_back(encode(R, nullptr));
     NoiseModel nm;
     size_t used = 1;
     Planes F, Wp;
@@ -484,10 +748,24 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
         const double sc = exposure_scale(ref_info, frame_info(fr));
         F = split(raw, W, H, float(black_level(fr)), float(sc), clip_level);
         Field fd;
-        if (opt.align) fd = align(rpyr, pyramid(grey(F)), int(opt.tile));
-        warp(F, opt.align ? &fd : nullptr, Wp, valid);
+        Homography h;
+        size_t inliers = 0, matched = 0;
+        if (aligned) {
+            Img g = grey(F);
+            fd = align(rpyr, pyramid(g), int(opt.tile));
+            if (projective) {
+                auto matches = match_controls(ref_control, control_image(std::move(g)), fd, points);
+                matched = matches.size();
+                if (!fit_homography(matches, R.w, R.h, h, inliers)) {
+                    log("frame " + std::to_string(idx) + ": insufficient homography support (" +
+                        std::to_string(inliers) + "/" + std::to_string(matched) + " matches), skipped");
+                    continue;
+                }
+            }
+        }
+        warp(F, aligned && !projective ? &fd : nullptr, projective ? &h : nullptr, Wp, valid);
         double wtot = 0;
-        if (median) {
+        if (per_sample) {
             store.push_back(encode(Wp, &valid));
             for (uint8_t v : valid) wtot += v;
         } else {
@@ -535,24 +813,35 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
         for (float v : wm.d) wtot += v;
         }
         used++;
-        // report the median displacement and mean weight
-        char b[160];
+        // Report the centre displacement for a homography, the median displacement for tiles.
+        char b[192];
         float mdx = 0, mdy = 0;
-        if (opt.align) {
+        if (projective) {
+            double dx, dy;
+            h.displacement(h.cx, h.cy, dx, dy);
+            mdx = float(2 * dx); mdy = float(2 * dy);
+        } else if (aligned) {
             std::vector<float> ax = fd.dx, ay = fd.dy;
             std::nth_element(ax.begin(), ax.begin() + long(ax.size() / 2), ax.end());
             std::nth_element(ay.begin(), ay.begin() + long(ay.size() / 2), ay.end());
             mdx = 2 * ax[ax.size() / 2]; mdy = 2 * ay[ay.size() / 2];  // sensor pixels
         }
         snprintf(b, sizeof b, "frame %4zu: shift %+6.1f %+6.1f px, exposure x%.3f, %s %5.1f %%", idx, mdx, mdy, sc,
-                 median ? "usable" : "merged", 100.0 * wtot / double(valid.size()));
-        log(b);
+                 per_sample ? "usable" : "merged", 100.0 * wtot / double(valid.size()));
+        std::string message = b;
+        if (projective) message += ", control points " + std::to_string(inliers) + "/" + std::to_string(matched);
+        log(message);
     }
 
-    if (median) {
-        // per-sample median over the frames that cover it (the reference always does)
+    if (projective && used == 1 && std::any_of(frames.begin(), frames.end(), [ref](size_t idx) { return idx != ref; })) {
+        err = "no other frame could be aligned to reference " + std::to_string(ref) + " with a homography";
+        return false;
+    }
+
+    if (per_sample) {
+        // Merge the frames that cover each sample (the reference always does).
         parallel_for(R.h, [&](int y0, int y1) {
-            std::vector<float> v(store.size());
+            std::vector<uint16_t> values(store.size());
             const size_t plane = size_t(R.w) * R.h;
             for (int y = y0; y < y1; y++)
                 for (int x = 0; x < R.w; x++) {
@@ -561,11 +850,15 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
                     for (int k = 0; k < 4; k++) {
                         size_t n = 0;
                         for (auto &s : store)
-                            if (uint16_t u = s[k * plane + o]) v[n++] = decode_sample(u);
-                        auto mid = v.begin() + long(n / 2);
-                        std::nth_element(v.begin(), mid, v.begin() + long(n));
-                        float m = *mid;
-                        if (!(n & 1)) m = 0.5f * (m + *std::max_element(v.begin(), mid));
+                            if (uint16_t u = s[k * plane + o]) values[n++] = u;
+                        if (trimmed) {
+                            acc.p[k].d[o] = trimmed_mean(values.data(), values.data() + n, opt.trim_percent);
+                            continue;
+                        }
+                        auto mid = values.begin() + long(n / 2);
+                        std::nth_element(values.begin(), mid, values.begin() + long(n));
+                        float m = decode_sample(*mid);
+                        if (!(n & 1)) m = 0.5f * (m + decode_sample(*std::max_element(values.begin(), mid)));
                         acc.p[k].d[o] = m;
                     }
                     wsum.d[o] = 1;
