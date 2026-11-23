@@ -251,6 +251,47 @@ static void high_black(const fs::path &dir) {
     require(result.px[1]==8000,"large negative black-subtracted samples were clipped in storage");
 }
 
+static void shared_crop(const fs::path &dir) {
+    auto movie=camera();movie.active_x=1;movie.active_y=1;movie.active_w=30;movie.active_h=22;
+    nev::FrameInfo info;std::copy_n(std::array<float,4>{.25f,1.5f,2.75f,3}.begin(),4,info.black_delta);
+    std::vector<uint16_t> original(32*24);
+    for(size_t i=0;i<original.size();++i)original[i]=uint16_t(1000+i);
+    for(unsigned y:{2u,3u})for(unsigned x:{2u,3u}) {
+        nev::Crop crop{x,y,12,10};unsigned w=32,h=24;
+        auto pixels=original;auto m=movie;auto fi=info;std::string err;
+        require(nev::crop_bayer(pixels,w,h,m,fi,crop,err),err.c_str());
+        require(w==12&&h==10&&m.crop_x==0&&m.crop_y==0&&m.crop_w==12&&m.crop_h==10,"crop geometry not rebased");
+        require(!m.active_w&&!m.active_h,"source active area leaked into crop");
+        for(unsigned row=0;row<h;++row)for(unsigned col=0;col<w;++col)
+            require(pixels[row*w+col]==original[(row+y)*32+col+x],"Bayer crop changed sample positions");
+        for(unsigned k=0;k<4;++k) {
+            unsigned old=(((k/2)+y)&1)*2+(((k%2)+x)&1);
+            require(fi.cfa[k]==info.cfa[old]&&fi.black_delta[k]==info.black_delta[old],"crop changed CFA/black phase");
+        }
+        nev::DngOptions options;options.black_level=512;options.compression=nev::DngCompression::None;
+        write(dir/"cropped.dng",nev::build_dng(pixels,w,h,m,fi,0,"source",options));
+        auto reread=read(dir/"cropped.dng");
+        require(reread.pixels==pixels&&std::equal(fi.cfa,fi.cfa+4,reread.info.cfa),"cropped Bayer DNG roundtrip wrong");
+        for(unsigned k=0;k<4;++k)
+            require(std::abs(reread.black+reread.info.black_delta[k]-(512+fi.black_delta[k]))<.001f,"cropped DNG black levels shifted incorrectly");
+    }
+    nev::RawPhoto photo;photo.width=32;photo.height=24;photo.black=512;photo.white=16383;
+    photo.movie=movie;photo.info=info;photo.pixels=original;
+    auto reader=[&](size_t,nev::RawPhoto &p,std::string&){p=photo;return true;};
+    for(auto merge:{nev::StackMerge::Mean,nev::StackMerge::Median,nev::StackMerge::TrimmedMean}) {
+        nev::StackOptions options;options.alignment=nev::StackAlignment::None;options.merge=merge;
+        nev::StackResult full,cropped;std::string err;
+        require(nev::stack_frames(reader,{0,1},0,options,full,err,[](const auto&){}),err.c_str());
+        options.crop={3,5,12,10};
+        require(nev::stack_frames(reader,{0,1},0,options,cropped,err,[](const auto&){}),err.c_str());
+        require(cropped.width==12&&cropped.height==10&&cropped.info.cfa[0]==2,"stack crop dimensions/CFA wrong");
+        for(unsigned y=0;y<10;++y)for(unsigned x=0;x<12;++x)
+            require(cropped.px[y*12+x]==full.px[(y+5)*32+x+3],"stack crop differs from full-frame result");
+        options.crop={31,0,2,2};
+        require(!nev::stack_frames(reader,{0,1},0,options,cropped,err,[](const auto&){}),"invalid stack crop accepted");
+    }
+}
+
 static void jpeg_predictors() {
     // Independently specified 2x2 fixtures. Reduced-precision samples are
     // initial+[2,3,0,7]; these are the known final differences for predictors 1..7.
@@ -306,7 +347,7 @@ int main() {
         roundtrip(dir);
         for(unsigned bits:{8,12,14,16}) for(bool little:{false,true}) packed(dir,bits,little);
         sr_black();
-        stack_levels();input_source(dir);selection();atomic_output(dir);high_black(dir);jpeg_predictors();
+        stack_levels();input_source(dir);selection();atomic_output(dir);high_black(dir);jpeg_predictors();shared_crop(dir);
         std::cout<<"Raw input tests passed\n";return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

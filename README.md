@@ -67,8 +67,17 @@ starting point; `0.42` smooths more, while `0.20` or `0.10` needs more sharp fra
 and varied subpixel positions. Higher scale alone cannot create missing detail.
 Sparse regions blend back toward interpolation from the reference.
 
-Use `--crop X,Y,W,H` to try a small SR region first. Coordinates refer to the
-reference's coded sensor grid before orientation. `--bayer` requests a mosaic
+`--crop X,Y,W,H` is shared by `dng`, `stack`, and `sr`. Coordinates refer to the
+source's coded sensor grid (the reference for a merge), before orientation and SR
+scaling. Conversion extracts the original samples; stacking aligns/merges the full
+frame and crops its result; SR reconstructs the requested region. For example:
+
+```powershell
+.\nevtoraw.exe stack examples\4 --merge trimmed-mean --crop 1000,1000,256,256
+.\nevtoraw.exe dng photo.NEF --crop 1000,1000,256,256
+```
+
+Use a small crop for initial SR experiments. `--bayer` requests a mosaic
 instead of the default camera-native RGB LinearRaw DNG. Both retain calibration
 and white balance for subsequent processing.
 

@@ -6,12 +6,8 @@
 
 namespace nev {
 
-struct SrCrop {
-    unsigned x = 0, y = 0, width = 0, height = 0;
-};
-
 struct SrOptions {
-    SrCrop crop;
+    Crop crop;
     bool linear = true;
     float kernel_sigma = 0.30f; // Gaussian width in input sensor pixels
     unsigned scale = 2;        // Output pixels per input sensor pixel, on each axis

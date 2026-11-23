@@ -22,6 +22,7 @@ first file; compatibility of selected frames is checked during processing.
 | `-o, --output DIR` | Destination directory. Files default beside the source, folders to `SOURCE/nevtoraw`. |
 | `-c, --compression ljpeg\|none` | Lossless JPEG (default) or uncompressed 16-bit output. |
 | `--white N` | Override white level, integer 1–65535, above source black levels. NEV defaults to 16383. |
+| `--crop X,Y,W,H` | Physical output region in coded source/reference sensor pixels, before orientation and SR scaling. Minimum 2×2. |
 | `-h, --help` | Show help, including after a command. |
 | `--version` | Print the program version. |
 
@@ -33,6 +34,15 @@ ranges, zero steps, trailing commas, negative indices, and malformed values are 
 `dng folder --frames all` exports every still. By default `dng` exports only index
 0, including for clips and folders. Conversion preserves decoded raw samples and
 levels; Nikon lossy NEFs are already linearized.
+
+Cropping is available in `dng`, `stack`, and `sr`. With no crop, source default
+crop metadata is preserved. An explicit crop extracts that exact coded rectangle,
+rebases the output to `(0,0)`, and adjusts Bayer pattern/black-level phase for odd
+origins. The original orientation is retained. Conversion preserves sample values.
+Stacking aligns and merges full frames before extracting the crop, so its alignment
+and memory requirements are unchanged. SR reconstructs only the requested output
+region, retaining full-frame information for alignment. All coordinates and sizes
+are in input pixels; `--scale` multiplies the SR output dimensions afterward.
 
 ## Frame count and reference (`stack` and `sr`)
 
@@ -91,7 +101,6 @@ Black offsets are subtracted per CFA site before merging.
 | --- | --- |
 | `--scale 1\|2\|3\|4` | Magnification per axis, default 2. |
 | `--kernel-sigma N` | Finite positive Gaussian sigma in input sensor pixels, default 0.30. |
-| `--crop X,Y,W,H` | Coded reference sensor grid before orientation. Minimum 2×2. |
 | `--bayer` | Mosaic for later demosaicing; default camera-native RGB LinearRaw. |
 
 The reconstruction uses original CFA samples at transformed positions, with a
@@ -123,7 +132,8 @@ no separate robust rejection pass; use mostly static scenes.
 For NEV merges, the stem is the clip name; for still bursts, the reference filename.
 Stack filename indices give the selected interval; `ImageDescription` records the
 exact accepted list. SR descriptions include selection, count, reference, scale,
-and sigma. The Software tag carries the program version.
+and sigma. An explicit crop is recorded by all three processing commands.
+The Software tag carries the program version.
 
 A temporary file in the destination directory replaces an existing generated
 output only after a successful write. Source frames are protected from replacement.

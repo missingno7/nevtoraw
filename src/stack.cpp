@@ -731,6 +731,8 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
     RawPhoto reference;
     if (!read(ref, reference, err)) { err = "frame " + std::to_string(ref) + ": " + err; return false; }
     if (!valid_photo(reference)) { err = "invalid input geometry, CFA or levels"; return false; }
+    Crop crop;
+    if (!resolve_crop(opt.crop,reference.width,reference.height,crop,err)) return false;
     if (opt.tile < 8 || opt.tile > 256) { err = "alignment tile must be 16..512 sensor pixels"; return false; }
     const unsigned W = reference.width, H = reference.height;
     const float black = float(reference.black);
@@ -923,7 +925,7 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
             }
     });
     out.frames_used = used;
-    return true;
+    return crop_bayer(out.px,out.width,out.height,out.movie,out.info,opt.crop,err);
 }
 
 namespace {
@@ -964,7 +966,7 @@ ProjectiveMap sensor_map(const Homography &h, Position residual) {
     }};
 }
 
-Position refine_crop(const Img &reference, const Img &frame, const Homography &model, const SrCrop &crop) {
+Position refine_crop(const Img &reference, const Img &frame, const Homography &model, const Crop &crop) {
     Position shift;
     const int left = int(crop.x / 2), top = int(crop.y / 2);
     const int right = int((crop.x + crop.width) / 2), bottom = int((crop.y + crop.height) / 2);
@@ -1086,7 +1088,7 @@ void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width,
         }
 }
 
-void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const SrCrop &crop, const FrameInfo &info,
+void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const Crop &crop, const FrameInfo &info,
                     SrImage &out, float sigma, int scale) {
     // Bound the output tile to 256 pixels and keep tile origins on whole Bayer quads.
     const int tile = (128 / scale) * 2;
@@ -1150,34 +1152,24 @@ bool superresolve(const ReadPhoto &read, const std::vector<size_t> &selected, si
     if (!valid_photo(ref)) {
         err = "invalid input geometry, Bayer pattern or raw levels"; return false;
     }
-    const bool cropped = opt.crop.width != 0;
-    SrCrop crop = cropped ? opt.crop : SrCrop{0, 0, ref.width, ref.height};
-    if (crop.width < 2 || crop.height < 2 || crop.x > ref.width || crop.width > ref.width - crop.x ||
-        crop.y > ref.height || crop.height > ref.height - crop.y) {
-        err = "crop is outside the reference or smaller than 2 pixels"; return false;
-    }
+    const bool cropped = opt.crop.enabled();
+    Crop crop;
+    if (!resolve_crop(opt.crop,ref.width,ref.height,crop,err)) return false;
     const unsigned output_bytes_per_input = opt.scale * opt.scale * (opt.linear ? 6 : 2);
     if (uint64_t(crop.width) * crop.height > (UINT32_MAX - (1u << 20)) / output_bytes_per_input) {
         err = "output exceeds the DNG writer's 32-bit TIFF limit; use a smaller crop or scale"; return false;
     }
     g_threads = std::max(1u, std::thread::hardware_concurrency());
-    const auto movie = ref.movie;
+    auto movie = ref.movie;
     FrameInfo info = ref.info;
+    if (cropped) crop_metadata(movie,info,crop);
     std::fill(std::begin(info.black_delta), std::end(info.black_delta), 0);
-    if (cropped)
-        for (unsigned k = 0; k < 4; ++k)
-            info.cfa[k] = ref.info.cfa[((k >> 1) ^ (crop.y & 1)) * 2 + ((k & 1) ^ (crop.x & 1))];
     auto crop_movie = [&](unsigned scale) {
         auto m = movie;
-        m.crop_w = scale * (cropped ? crop.width : movie.crop_w);
-        m.crop_h = scale * (cropped ? crop.height : movie.crop_h);
-        m.crop_x = cropped ? 0 : scale * movie.crop_x;
-        m.crop_y = cropped ? 0 : scale * movie.crop_y;
-        m.explicit_crop = cropped || movie.explicit_crop;
-        m.active_x = cropped ? 0 : scale * movie.active_x;
-        m.active_y = cropped ? 0 : scale * movie.active_y;
-        m.active_w = cropped ? 0 : scale * movie.active_w;
-        m.active_h = cropped ? 0 : scale * movie.active_h;
+        m.crop_w *= scale; m.crop_h *= scale;
+        m.crop_x *= scale; m.crop_y *= scale;
+        m.active_x *= scale; m.active_y *= scale;
+        m.active_w *= scale; m.active_h *= scale;
         return m;
     };
     std::string frame_list = "selected frames:";

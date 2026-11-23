@@ -35,12 +35,12 @@ static void usage(FILE *stream = stderr) {
             "  -o, --output DIR    output directory (file: beside source; folder: SOURCE/nevtoraw)\n"
             "  -c, --compression C ljpeg (default, lossless) | none\n"
             "      --white N       override source white level (NEV default 16383)\n"
+            "      --crop X,Y,W,H  output region in source/reference sensor pixels (dng/stack/sr)\n"
             "  -r, --ref N         reference frame for stack or sr (default: middle of selected frames)\n"
             "  stack and sr:\n"
             "      --count N|all   use N frames spread across --frames, or every selected frame\n"
             "                      (sr default: up to 16; stack: every selected frame)\n"
             "  sr only:\n"
-            "      --crop X,Y,W,H  region in reference sensor pixels\n"
             "      --scale N       output magnification per axis (1 to 4; default: 2)\n"
             "      --kernel-sigma N  Gaussian width in input sensor pixels (default: 0.30)\n"
             "      --bayer         export a Bayer DNG\n"
@@ -117,7 +117,7 @@ static bool write_file(const nev::InputSource &source, const fs::path &out, cons
 }
 
 static int cmd_convert(const fs::path &input, const fs::path &output, const std::string &frames,
-                       nev::DngOptions options, bool white_given) {
+                       nev::DngOptions options, bool white_given, const nev::Crop &crop) {
     nev::InputSource source;
     std::string err;
     if (!source.open(input, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
@@ -130,6 +130,10 @@ static int cmd_convert(const fs::path &input, const fs::path &output, const std:
         const auto start = std::chrono::steady_clock::now();
         nev::RawPhoto photo;
         if (!source.read(index, photo, err)) { fprintf(stderr, "frame %zu: %s\n", index, err.c_str()); ++failed; continue; }
+        if (!nev::crop_bayer(photo.pixels,photo.width,photo.height,photo.movie,photo.info,crop,err)) {
+            fprintf(stderr, "frame %zu: %s\n", index, err.c_str()); ++failed; continue;
+        }
+        if (crop.enabled()) options.description = "nevtoraw Bayer export, " + nev::crop_description(crop);
         const auto name = source.name(index);
         std::string suffix;
         if (source.is_video()) {
@@ -198,6 +202,7 @@ static int cmd_merge(const fs::path &input, const fs::path &output, const std::s
         dng.description = "nevtoraw " + merge + " stack of " + std::to_string(result.frames_used) +
                           " frames, reference " + std::to_string(ref) + ", " + alignment;
         if (trimmed) dng.description += ", trim " + std::to_string(stack.trim_percent) + "% per tail";
+        if (stack.crop.enabled()) dng.description += ", " + nev::crop_description(stack.crop);
         dng.description += ", frames";
         std::sort(result.frames.begin(), result.frames.end());
         for (size_t index : result.frames) dng.description += " " + std::to_string(index);
@@ -224,6 +229,7 @@ static int cmd_merge(const fs::path &input, const fs::path &output, const std::s
         dng.description = "nevtoraw " + format + ", " + std::to_string(count) +
                           " frame(s), reference " + std::to_string(ref);
         dng.description += ", " + std::string(kernel);
+        if (sr.crop.enabled()) dng.description += ", " + nev::crop_description(sr.crop);
         dng.description += ", frames";
         for (size_t index : selected) dng.description += " " + std::to_string(index);
         const std::string suffix = "_sr" + output_scale +
@@ -301,13 +307,14 @@ static int run(int argc, char **argv) {
             count = number;
         } else if ((stack || sr) && a == "--counts") {
             fprintf(stderr, "use --count N|all to reconstruct one image per run\n"); return 2;
-        } else if (sr && a == "--crop") {
+        } else if (a == "--crop") {
             std::vector<size_t> values;
-            if (!parse_csv(next(), values) || values.size() != 4 || values[2] == 0 || values[3] == 0 ||
+            if (!parse_csv(next(), values) || values.size() != 4 || values[2] < 2 || values[3] < 2 ||
                 *std::max_element(values.begin(), values.end()) > UINT32_MAX) {
-                fprintf(stderr, "crop must be X,Y,W,H\n"); return 2;
+                fprintf(stderr, "crop must be X,Y,W,H with width and height at least 2\n"); return 2;
             }
             sr_opt.crop = {unsigned(values[0]), unsigned(values[1]), unsigned(values[2]), unsigned(values[3])};
+            sopt.crop = sr_opt.crop;
         } else if (sr && a == "--scale") {
             const std::string value = next();
             size_t scale;
@@ -365,7 +372,7 @@ static int run(int argc, char **argv) {
         fprintf(stderr, "--no-align cannot be combined with --align or --tile\n"); return 2;
     }
     if (sr || stack) return cmd_merge(fs::u8path(path), fs::u8path(outdir), frames, ref, count, sr_opt, sopt, opt, white_given, sr);
-    return cmd_convert(fs::u8path(path), fs::u8path(outdir), frames, opt, white_given);
+    return cmd_convert(fs::u8path(path), fs::u8path(outdir), frames, opt, white_given, sr_opt.crop);
 }
 
 static int guarded_run(int argc, char **argv) {

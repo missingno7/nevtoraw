@@ -55,6 +55,17 @@ assert "selected frames: 0 5 11 16" in text
 text = run("stack", burst / "frame_00.dng", "-o", root / "stack-default")
 assert "homography alignment" in text
 
+for command in ("dng", "stack"):
+    output = root / f"crop-{command}"
+    options = ["--no-align"] if command == "stack" else []
+    run(command, source, "--crop", "3,5,12,10", "-c", "none", "-o", output, *options)
+    path = next(output.glob("*.dng"))
+    data = tags(path)
+    assert struct.unpack("<I", data[256][2])[0] == 12
+    assert struct.unpack("<I", data[257][2])[0] == 10
+    assert data[33422][2] == bytes([0,1,1,2])  # BGGR input shifted by odd x/y.
+    assert b"crop 3,5,12,10 sensor px" in path.read_bytes()
+
 for scale in (1, 2, 3, 4):
     for bayer in (False, True):
         output = root / f"sr-{scale}-{bayer}"
@@ -94,7 +105,9 @@ for options in (["--scale", "0"], ["--scale", "5"], ["--kernel-sigma", "nan"],
 for options in (["--trim-percent", "20"], ["--no-align", "--align", "homography"],
                 ["--no-align", "--tile", "64"], ["--tile", "17"]):
     run("stack", source, *options, code=2)
-run("sr", source, "--crop", "999999,0,2,2", code=1)
+for command in ("dng", "stack", "sr"):
+    run(command, source, "--crop", "0,0,1,2", code=2)
+    run(command, source, "--crop", "999999,0,2,2", code=1)
 
 # Folder outputs stay out of subsequent source scans.
 run("dng", burst)

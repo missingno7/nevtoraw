@@ -4,6 +4,7 @@
 // a mosaic raw.
 #pragma once
 #include "raw.h"
+#include "crop.h"
 
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,7 @@ enum class StackMerge {
 enum class StackAlignment { None, Tiles, Homography };
 
 struct StackOptions {
+    Crop crop;
     StackMerge merge = StackMerge::Mean;
     unsigned trim_percent = 20; // percentage removed from each tail in TrimmedMean
     StackAlignment alignment = StackAlignment::Homography;
