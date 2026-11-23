@@ -155,7 +155,7 @@ void PrecinctPredecessorState::advance_precinct() {
     // gcli_store_[23] points to rotation_buf_a_ → still has last precinct's sb 23
 }
 
-void PrecinctPredecessorState::reset_gcli_state(const SubbandConfig config[26]) {
+void PrecinctPredecessorState::reset_gcli_state([[maybe_unused]] const SubbandConfig config[26]) {
     for (int i = 0; i < 26; i++) {
         if (gcli_store_[i] && ng_[i] > 0) {
             std::memset(gcli_store_[i], 0, ng_[i]);

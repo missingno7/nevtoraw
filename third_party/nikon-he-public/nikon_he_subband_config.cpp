@@ -153,7 +153,7 @@ void compute_subband_layout(int half_pass_W, SubbandConfig out[26]) {
     //
     // Within each LB, sub-bands are packed with round_up(ng, 8) spacing.
 
-    int lb_region[8] = {
+    [[maybe_unused]] int lb_region[8] = {
         lift_LB, lift_LB, memcpy_LB, lift_LB,   // LBs 0-3 (bufA)
         lift_LB, lift_LB, memcpy_LB, lift_LB,   // LBs 4-7 (bufB)
     };

@@ -2,7 +2,6 @@
 #include "stack.h"
 #include "sr.h"
 
-#include "he_decode.h"
 #include "meta.h"
 
 #include <algorithm>
@@ -10,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <thread>
@@ -50,7 +50,8 @@ struct Planes {
     std::vector<uint8_t> clip; // per quad: any sample at/above the clip level
 };
 
-Planes split(const std::vector<uint16_t> &raw, unsigned W, unsigned H, float black, float scale, unsigned clip_level) {
+Planes split(const std::vector<uint16_t> &raw, unsigned W, unsigned H, float black, float scale, unsigned clip_level,
+             const float *black_delta = nullptr) {
     Planes P;
     P.w = int(W / 2); P.h = int(H / 2);
     for (auto &i : P.p) i = Img(P.w, P.h);
@@ -62,7 +63,7 @@ Planes split(const std::vector<uint16_t> &raw, unsigned W, unsigned H, float bla
                 uint16_t v[4] = {r0[2 * x], r0[2 * x + 1], r1[2 * x], r1[2 * x + 1]};
                 bool c = false;
                 for (int k = 0; k < 4; k++) {
-                    P.p[k].at(x, y) = (float(v[k]) - black) * scale;
+                    P.p[k].at(x, y) = (float(v[k]) - black - (black_delta ? black_delta[k] : 0)) * scale;
                     c |= v[k] >= clip_level;
                 }
                 P.clip[size_t(y) * P.w + x] = c;
@@ -532,6 +533,21 @@ bool fit_homography(const std::vector<Match> &matches, int width, int height, Ho
     return true;
 }
 
+struct HomographyFit {
+    Homography model;
+    size_t matched = 0, inliers = 0;
+    bool valid = false;
+};
+
+HomographyFit fit_frame_homography(const ControlImage &ref, const ControlImage &frame,
+                                   const Field &prior, const std::vector<ControlPoint> &points) {
+    const auto matches = match_controls(ref, frame, prior, points);
+    HomographyFit fit;
+    fit.matched = matches.size();
+    fit.valid = fit_homography(matches, ref.fine.w, ref.fine.h, fit.model, fit.inliers);
+    return fit;
+}
+
 inline void catmull(float t, float w[4]) {
     float t2 = t * t, t3 = t2 * t;
     w[0] = 0.5f * (-t3 + 2 * t2 - t);
@@ -681,15 +697,14 @@ std::vector<uint16_t> encode(const Planes &P, const std::vector<uint8_t> *valid)
 }
 inline float decode_sample(uint16_t u) { return (float(u) - 4096.0f) * 0.5f; }
 
-float trimmed_mean(uint16_t *begin, uint16_t *end, unsigned percent) {
+float trimmed_mean(float *begin, float *end, unsigned percent) {
     const auto trim = (end - begin) * percent / 100;
     auto *low = begin + trim, *high = end - trim;
     if (trim) {
         std::nth_element(begin, low, end);
         std::nth_element(low, high, end);
     }
-    const auto sum = std::accumulate(low, high, uint64_t{0});
-    return float((double(sum) / (high - low) - 4096.0) * 0.5);
+    return float(std::accumulate(low, high, 0.0) / (high - low));
 }
 
 double exposure_scale(const FrameInfo &ref, const FrameInfo &f) {
@@ -703,29 +718,32 @@ double exposure_scale(const FrameInfo &ref, const FrameInfo &f) {
 
 } // namespace
 
-bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, const StackOptions &opt,
+bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size_t ref, const StackOptions &opt,
                   StackResult &out, std::string &err, const StackLog &log) {
     const bool trimmed = opt.merge == StackMerge::TrimmedMean;
     if (trimmed && opt.trim_percent > 49) { err = "trim percentage must be 0..49"; return false; }
     const bool per_sample = opt.merge != StackMerge::Mean;
     g_threads = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
-    auto decode = [&](size_t idx, Frame &fr, std::vector<uint16_t> &raw) {
-        if (!f.read_frame(idx, fr, err)) return false;
-        if (!nefcomp::he_decode(fr.codestream(), fr.cs_len, fr.width, fr.height, raw, err)) return false;
-        return true;
-    };
-    std::vector<uint16_t> raw;
-    Frame &rf = out.ref_frame;
-    if (!decode(ref, rf, raw)) { err = "frame " + std::to_string(ref) + ": " + err; return false; }
-    const unsigned W = rf.width, H = rf.height;
-    if ((W | H) & 1) { err = "odd frame size"; return false; }
-    const float black = float(black_level(rf));
-    const unsigned clip_level = opt.white > 512 ? opt.white - 256 : opt.white;
-    const FrameInfo ref_info = frame_info(rf);
+    if (frames.empty() || !std::binary_search(frames.begin(), frames.end(), ref) ||
+        std::adjacent_find(frames.begin(), frames.end(), std::greater_equal<size_t>{}) != frames.end()) {
+        err = "selected frames must be sorted, unique and include the reference"; return false;
+    }
+    RawPhoto reference;
+    if (!read(ref, reference, err)) { err = "frame " + std::to_string(ref) + ": " + err; return false; }
+    if (!valid_photo(reference)) { err = "invalid input geometry, CFA or levels"; return false; }
+    if (opt.tile < 8 || opt.tile > 256) { err = "alignment tile must be 16..512 sensor pixels"; return false; }
+    const unsigned W = reference.width, H = reference.height;
+    const float black = float(reference.black);
+    auto clipping = [](unsigned white) { return white - (white > 512 ? (white + 63) / 64 : 0); };
+    const unsigned clip_level = clipping(reference.white);
+    const FrameInfo ref_info = reference.info;
+    out.movie = reference.movie; out.info = reference.info;
+    std::fill(std::begin(out.info.black_delta), std::end(out.info.black_delta), 0);
     const bool aligned = opt.alignment != StackAlignment::None;
     const bool projective = opt.alignment == StackAlignment::Homography;
 
-    Planes R = split(raw, W, H, black, 1.0f, clip_level);
+    Planes R = split(reference.pixels, W, H, black, 1.0f, clip_level, ref_info.black_delta);
+    reference.pixels.clear(); reference.pixels.shrink_to_fit();
     Img rg = grey(R);
     auto rpyr = aligned ? pyramid(rg) : std::vector<Img>{};
     ControlImage ref_control = projective ? control_image(rg) : ControlImage{};
@@ -735,19 +753,35 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
     // accumulators: start with the reference at weight 1 (clipped reference quads stay reference-only)
     Planes acc = R;
     Img wsum(R.w, R.h, 1.0f);
-    std::vector<std::vector<uint16_t>> store; // every aligned frame, reference first
-    if (per_sample) store.push_back(encode(R, nullptr));
+    std::vector<std::vector<uint16_t>> store; // compact half-DN samples for 12/14-bit sources
+    std::vector<std::vector<float>> precise_store; // preserve the range of 16-bit DNGs
+    const bool precise = reference.white > 16383 ||
+        std::any_of(std::begin(ref_info.black_delta), std::end(ref_info.black_delta),
+                    [&](float delta) { return black + delta > 2047; });
+    auto store_frame = [&](const Planes &p, const std::vector<uint8_t> *valid) {
+        if (!precise) { store.push_back(encode(p, valid)); return; }
+        size_t plane = size_t(p.w) * p.h;
+        std::vector<float> samples(4 * plane, std::numeric_limits<float>::quiet_NaN());
+        for (size_t i = 0; i < plane; ++i) {
+            if (valid && !(*valid)[i]) continue;
+            for (unsigned k = 0; k < 4; ++k) samples[k*plane+i] = p.p[k].d[i];
+        }
+        precise_store.push_back(std::move(samples));
+    };
+    if (per_sample) store_frame(R, nullptr);
     NoiseModel nm;
     size_t used = 1;
+    out.frames = {ref};
     Planes F, Wp;
     std::vector<uint8_t> valid;
     for (size_t idx : frames) {
         if (idx == ref) continue;
-        Frame fr;
-        if (!decode(idx, fr, raw)) { log("frame " + std::to_string(idx) + ": " + err + ", skipped"); continue; }
-        if (fr.width != W || fr.height != H) { log("frame " + std::to_string(idx) + ": size differs, skipped"); continue; }
-        const double sc = exposure_scale(ref_info, frame_info(fr));
-        F = split(raw, W, H, float(black_level(fr)), float(sc), clip_level);
+        RawPhoto photo;
+        if (!read(idx, photo, err)) { err = "frame " + std::to_string(idx) + ": " + err; return false; }
+        const bool compatible = compatible_photos(reference, photo);
+        if (!compatible) { err = "frame " + std::to_string(idx) + ": incompatible raw geometry, CFA or calibration"; return false; }
+        const double sc = exposure_scale(ref_info, photo.info) * double(reference.white-reference.black) / (photo.white-photo.black);
+        F = split(photo.pixels, W, H, float(photo.black), float(sc), clipping(photo.white), photo.info.black_delta);
         Field fd;
         Homography h;
         size_t inliers = 0, matched = 0;
@@ -755,9 +789,9 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
             Img g = grey(F);
             fd = align(rpyr, pyramid(g), int(opt.tile));
             if (projective) {
-                auto matches = match_controls(ref_control, control_image(std::move(g)), fd, points);
-                matched = matches.size();
-                if (!fit_homography(matches, R.w, R.h, h, inliers)) {
+                const auto fit = fit_frame_homography(ref_control, control_image(std::move(g)), fd, points);
+                matched = fit.matched; inliers = fit.inliers; h = fit.model;
+                if (!fit.valid) {
                     log("frame " + std::to_string(idx) + ": insufficient homography support (" +
                         std::to_string(inliers) + "/" + std::to_string(matched) + " matches), skipped");
                     continue;
@@ -767,53 +801,54 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
         warp(F, aligned && !projective ? &fd : nullptr, projective ? &h : nullptr, Wp, valid);
         double wtot = 0;
         if (per_sample) {
-            store.push_back(encode(Wp, &valid));
+            store_frame(Wp, &valid);
             for (uint8_t v : valid) wtot += v;
         } else {
-        Img wlp = box3(grey(Wp));
-        if (!nm.ok) {
-            nm = fit_noise(rlp, wlp, valid);
-            if (nm.ok) {
-                char b[128];
-                snprintf(b, sizeof b, "noise model: sigma(s) = sqrt(%.3f*s + %.1f) DN (low-passed grey difference)", nm.A, nm.B);
-                log(b);
+            Img wlp = box3(grey(Wp));
+            if (!nm.ok) {
+                nm = fit_noise(rlp, wlp, valid);
+                if (nm.ok) {
+                    char b[128];
+                    snprintf(b, sizeof b, "noise model: sigma(s) = sqrt(%.3f*s + %.1f) DN (low-passed grey difference)", nm.A, nm.B);
+                    log(b);
+                }
             }
-        }
-        // per-quad robust weight, then a 3x3 minimum so motion edges are rejected as a whole
-        Img w(R.w, R.h, 0.0f);
-        parallel_for(R.h, [&](int y0, int y1) {
-            for (int y = y0; y < y1; y++)
-                for (int x = 0; x < R.w; x++) {
-                    size_t o = size_t(y) * R.w + x;
-                    if (!valid[o] || R.clip[o]) continue;
-                    double z = std::fabs(wlp.d[o] - rlp.d[o]) / nm.sigma(rlp.d[o]);
-                    w.d[o] = float(std::clamp((opt.z_hi - z) / (opt.z_hi - opt.z_lo), 0.0, 1.0));
-                }
-        });
-        Img wm(R.w, R.h);
-        parallel_for(R.h, [&](int y0, int y1) {
-            for (int y = y0; y < y1; y++)
-                for (int x = 0; x < R.w; x++) {
-                    float m = 1;
-                    for (int j = -1; j <= 1; j++)
-                        for (int i = -1; i <= 1; i++)
-                            m = std::min(m, w.at(std::clamp(x + i, 0, R.w - 1), std::clamp(y + j, 0, R.h - 1)));
-                    wm.at(x, y) = m;
-                }
-        });
-        parallel_for(R.h, [&](int y0, int y1) {
-            for (int y = y0; y < y1; y++)
-                for (int x = 0; x < R.w; x++) {
-                    size_t o = size_t(y) * R.w + x;
-                    float ww = wm.d[o];
-                    if (ww <= 0) continue;
-                    for (int k = 0; k < 4; k++) acc.p[k].d[o] += ww * Wp.p[k].d[o];
-                    wsum.d[o] += ww;
-                }
-        });
-        for (float v : wm.d) wtot += v;
+            // per-quad robust weight, then a 3x3 minimum so motion edges are rejected as a whole
+            Img w(R.w, R.h, 0.0f);
+            parallel_for(R.h, [&](int y0, int y1) {
+                for (int y = y0; y < y1; y++)
+                    for (int x = 0; x < R.w; x++) {
+                        size_t o = size_t(y) * R.w + x;
+                        if (!valid[o] || R.clip[o]) continue;
+                        double z = std::fabs(wlp.d[o] - rlp.d[o]) / nm.sigma(rlp.d[o]);
+                        w.d[o] = float(std::clamp((opt.z_hi - z) / (opt.z_hi - opt.z_lo), 0.0, 1.0));
+                    }
+            });
+            Img wm(R.w, R.h);
+            parallel_for(R.h, [&](int y0, int y1) {
+                for (int y = y0; y < y1; y++)
+                    for (int x = 0; x < R.w; x++) {
+                        float m = 1;
+                        for (int j = -1; j <= 1; j++)
+                            for (int i = -1; i <= 1; i++)
+                                m = std::min(m, w.at(std::clamp(x + i, 0, R.w - 1), std::clamp(y + j, 0, R.h - 1)));
+                        wm.at(x, y) = m;
+                    }
+            });
+            parallel_for(R.h, [&](int y0, int y1) {
+                for (int y = y0; y < y1; y++)
+                    for (int x = 0; x < R.w; x++) {
+                        size_t o = size_t(y) * R.w + x;
+                        float ww = wm.d[o];
+                        if (ww <= 0) continue;
+                        for (int k = 0; k < 4; k++) acc.p[k].d[o] += ww * Wp.p[k].d[o];
+                        wsum.d[o] += ww;
+                    }
+            });
+            for (float v : wm.d) wtot += v;
         }
         used++;
+        out.frames.push_back(idx);
         // Report the centre displacement for a homography, the median displacement for tiles.
         char b[192];
         float mdx = 0, mdy = 0;
@@ -842,7 +877,7 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
     if (per_sample) {
         // Merge the frames that cover each sample (the reference always does).
         parallel_for(R.h, [&](int y0, int y1) {
-            std::vector<uint16_t> values(store.size());
+            std::vector<float> values(precise ? precise_store.size() : store.size());
             const size_t plane = size_t(R.w) * R.h;
             for (int y = y0; y < y1; y++)
                 for (int x = 0; x < R.w; x++) {
@@ -850,16 +885,19 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
                     if (R.clip[o]) continue;  // clipped reference quad: keep the reference
                     for (int k = 0; k < 4; k++) {
                         size_t n = 0;
-                        for (auto &s : store)
-                            if (uint16_t u = s[k * plane + o]) values[n++] = u;
+                        if (precise) {
+                            for (auto &s : precise_store)
+                                if (float v = s[k*plane+o]; std::isfinite(v)) values[n++] = v;
+                        } else for (auto &s : store)
+                            if (uint16_t u = s[k * plane + o]) values[n++] = decode_sample(u);
                         if (trimmed) {
                             acc.p[k].d[o] = trimmed_mean(values.data(), values.data() + n, opt.trim_percent);
                             continue;
                         }
                         auto mid = values.begin() + long(n / 2);
                         std::nth_element(values.begin(), mid, values.begin() + long(n));
-                        float m = decode_sample(*mid);
-                        if (!(n & 1)) m = 0.5f * (m + decode_sample(*std::max_element(values.begin(), mid)));
+                        float m = *mid;
+                        if (!(n & 1)) m = 0.5f * (m + *std::max_element(values.begin(), mid));
                         acc.p[k].d[o] = m;
                     }
                     wsum.d[o] = 1;
@@ -868,10 +906,10 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
     }
 
     // output: scaled 16-bit mosaic
-    const float S = float(opt.out_scale);
+    const float S = float(65535 / reference.white);
     out.width = W; out.height = H;
     out.black = unsigned(std::lround(black * S));
-    out.white = unsigned(std::min(65535.0f, std::round((float(opt.white) - black) * S + black * S)));
+    out.white = unsigned(reference.white * S);
     out.px.assign(size_t(W) * H, 0);
     parallel_for(R.h, [&](int y0, int y1) {
         for (int y = y0; y < y1; y++)
@@ -961,31 +999,11 @@ Position refine_crop(const Img &reference, const Img &frame, const Homography &m
 }
 
 struct RegisteredPhoto {
-    size_t index;
     RawPhoto photo;
     ProjectiveMap forward, backward;
     float exposure = 1;
 };
 
-// Pick different sampling phases first so smaller subsets cover the Bayer period.
-void order_by_phase(std::vector<RegisteredPhoto> &frames, const SrCrop &crop) {
-    const double x = crop.x + .5 * crop.width, y = crop.y + .5 * crop.height;
-    auto distance = [](Position a, Position b) {
-        const double dx = std::remainder(a.x - b.x, 2), dy = std::remainder(a.y - b.y, 2);
-        return dx * dx + dy * dy;
-    };
-    std::vector<Position> phases;
-    for (const auto &f : frames) phases.push_back(f.forward.at(x, y));
-    std::vector<double> nearest(frames.size(), 8);
-    for (size_t i = 1; i < frames.size(); ++i) {
-        for (size_t j = i; j < frames.size(); ++j)
-            nearest[j] = std::min(nearest[j], distance(phases[i - 1], phases[j]));
-        size_t best = size_t(std::max_element(nearest.begin() + i, nearest.end()) - nearest.begin());
-        std::swap(frames[i], frames[best]);
-        std::swap(phases[i], phases[best]);
-        std::swap(nearest[i], nearest[best]);
-    }
-}
 
 struct Moments {
     float sum = 0, x = 0, y = 0, xx = 0, xy = 0, yy = 0;
@@ -1023,7 +1041,7 @@ float reference_color(const RawPhoto &p, int color, double x, double y) {
         const double fx = px - ax, fy = py - ay;
         auto at = [&](int u, int v) { return p.pixels[size_t(2*v + oy) * p.width + 2*u + ox]; };
         result += (1-fy) * ((1-fx) * at(ax, ay) + fx * at(bx, ay)) +
-                  fy * ((1-fx) * at(ax, by) + fx * at(bx, by));
+                  fy * ((1-fx) * at(ax, by) + fx * at(bx, by)) - p.info.black_delta[site];
         ++count;
     }
     return float(result / count - p.black);
@@ -1034,11 +1052,11 @@ constexpr float sr_radius_squared = sr_radius * sr_radius;
 using Kernel = std::array<float, 1025>;
 
 void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width, int height,
-                     const Kernel &kernel, std::vector<Moments> &moment) {
+                     int scale, const Kernel &kernel, std::vector<Moments> &moment) {
     const auto &p = frame.photo;
     Position low{double(p.width), double(p.height)}, high{-1, -1};
-    for (int x : {left - 2, left + width / 2 + 2})
-        for (int y : {top - 2, top + height / 2 + 2}) {
+    for (int x : {left - 2, left + width / scale + 2})
+        for (int y : {top - 2, top + height / scale + 2}) {
             Position s = frame.forward.at(x, y);
             low.x = std::min(low.x, s.x); low.y = std::min(low.y, s.y);
             high.x = std::max(high.x, s.x); high.y = std::max(high.y, s.y);
@@ -1046,18 +1064,20 @@ void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width,
     const int first_x = std::max(0, int(std::floor(low.x))), first_y = std::max(0, int(std::floor(low.y)));
     const int last_x = std::min(int(p.width) - 1, int(std::ceil(high.x)));
     const int last_y = std::min(int(p.height) - 1, int(std::ceil(high.y)));
-    constexpr float radius = 2 * sr_radius;
+    const float radius = scale * sr_radius;
+    const float pitch = 1.0f / scale;
     for (int y = first_y; y <= last_y; ++y)
         for (int x = first_x; x <= last_x; ++x) {
             Position pos = frame.backward.at(x, y);
-            float cx = float(2 * (pos.x - left) + .5), cy = float(2 * (pos.y - top) + .5);
+            float cx = float(scale * (pos.x - left + .5) - .5);
+            float cy = float(scale * (pos.y - top + .5) - .5);
             const unsigned color = p.info.cfa[(y & 1) * 2 + (x & 1)];
-            const float value = (float(p.pixels[size_t(y) * p.width + x]) - p.black) * frame.exposure;
+            const float value = (float(p.pixels[size_t(y) * p.width + x]) - p.black - p.info.black_delta[(y & 1) * 2 + (x & 1)]) * frame.exposure;
             const int y0 = std::max(0, int(std::ceil(cy - radius))), y1 = std::min(height - 1, int(std::floor(cy + radius)));
             const int x0 = std::max(0, int(std::ceil(cx - radius))), x1 = std::min(width - 1, int(std::floor(cx + radius)));
             for (int oy = y0; oy <= y1; ++oy)
                 for (int ox = x0; ox <= x1; ++ox) {
-                    float dx = .5f * (cx - ox), dy = .5f * (cy - oy);
+                    float dx = pitch * (cx - ox), dy = pitch * (cy - oy);
                     float d2 = dx * dx + dy * dy;
                     if (d2 > sr_radius_squared) continue;
                     auto weight = kernel[size_t(d2 * ((kernel.size() - 1) / sr_radius_squared))];
@@ -1067,63 +1087,67 @@ void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width,
 }
 
 void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const SrCrop &crop, const FrameInfo &info,
-                    const std::vector<size_t> &counts, std::vector<SrImage> &results) {
-    constexpr int tile = 128;
-    const int width = int(2 * crop.width), height = int(2 * crop.height);
+                    SrImage &out, float sigma, int scale) {
+    // Bound the output tile to 256 pixels and keep tile origins on whole Bayer quads.
+    const int tile = (128 / scale) * 2;
+    const int out_tile = scale * tile;
+    const int width = int(out.width), height = int(out.height);
     const int columns = (int(crop.width) + tile - 1) / tile, rows = (int(crop.height) + tile - 1) / tile;
     const auto &ref = frames.front().photo;
-    const float scale = float(65535 / ref.white);
+    const float code_scale = float(65535 / ref.white);
     Kernel kernel;
+    const double variance = double(sigma) * sigma;
     for (size_t i = 0; i < kernel.size(); ++i) {
-        constexpr float sigma = .42f;
-        float d2 = float(i) * sr_radius_squared / float(kernel.size() - 1);
-        kernel[i] = std::exp(-d2 / (2 * sigma * sigma));
+        double d2 = double(i) * sr_radius_squared / double(kernel.size() - 1);
+        kernel[i] = float(std::exp(-d2 / (2 * variance)));
     }
     parallel_for(columns * rows, [&](int first, int last) {
         for (int index = first; index < last; ++index) {
-            const int x0 = 2 * tile * (index % columns), y0 = 2 * tile * (index / columns);
-            const int w = std::min(width - x0, 2 * tile), h = std::min(height - y0, 2 * tile);
-            const int left = int(crop.x) + x0 / 2, top = int(crop.y) + y0 / 2;
+            const int x0 = out_tile * (index % columns), y0 = out_tile * (index / columns);
+            const int w = std::min(width - x0, out_tile), h = std::min(height - y0, out_tile);
+            const int left = int(crop.x) + x0 / scale, top = int(crop.y) + y0 / scale;
             std::vector<Moments> moment(size_t(w) * h * 3);
-            size_t next = 0;
-            for (size_t n = 0; n < frames.size(); ++n) {
-                accumulate_tile(frames[n], left, top, w, h, kernel, moment);
-                if (n + 1 != counts[next]) continue;
-                SrImage &out = results[next];
-                for (int y = 0; y < h; ++y)
-                    for (int x = 0; x < w; ++x) {
-                        const size_t i = size_t(y) * w + x, o = size_t(y + y0) * out.width + x + x0;
-                        const unsigned site = info.cfa[(y & 1) * 2 + (x & 1)];
-                        for (unsigned c = 0; c < 3; ++c) {
-                            if (!out.linear && c != site) continue;
-                            const auto &m = moment[3 * i + c];
-                            float v = m.sum > 1e-6f ? m.estimate() : 0;
-                            if (m.sum < .25f) {
-                                float base = reference_color(ref, int(c), left + .5 * x - .25, top + .5 * y - .25);
-                                float w = 4 * m.sum;
-                                v = w * v + (1 - w) * base;
-                            }
-                            uint16_t packed = uint16_t(std::lround(std::clamp((v + ref.black) * scale, 0.0f, float(out.white))));
-                            out.pixels[out.linear ? 3 * o + c : o] = packed;
+            for (const auto &frame : frames)
+                accumulate_tile(frame, left, top, w, h, scale, kernel, moment);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const size_t i = size_t(y) * w + x, o = size_t(y + y0) * out.width + x + x0;
+                    const unsigned site = info.cfa[(y & 1) * 2 + (x & 1)];
+                    for (unsigned c = 0; c < 3; ++c) {
+                        if (!out.linear && c != site) continue;
+                        const auto &m = moment[3 * i + c];
+                        float v = m.sum > 1e-6f ? m.estimate() : 0;
+                        if (m.sum < .25f) {
+                            float base = reference_color(ref, int(c), left + (x + .5) / scale - .5,
+                                                         top + (y + .5) / scale - .5);
+                            float w = 4 * m.sum;
+                            v = w * v + (1 - w) * base;
                         }
+                        uint16_t packed = uint16_t(std::lround(std::clamp((v + ref.black) * code_scale, 0.0f, float(out.white))));
+                        out.pixels[out.linear ? 3 * o + c : o] = packed;
                     }
-                if (++next == counts.size()) break;
-            }
+                }
         }
     });
 }
 
 } // namespace
 
-bool superresolve(const ReadPhoto &read, const std::vector<size_t> &candidates, size_t reference,
+bool superresolve(const ReadPhoto &read, const std::vector<size_t> &selected, size_t reference,
                   const SrOptions &opt, const SaveSr &save, std::string &err, const StackLog &log) {
+    if (!std::isfinite(opt.kernel_sigma) || opt.kernel_sigma <= 0) {
+        err = "kernel sigma must be finite and positive"; return false;
+    }
+    if (opt.scale < 1 || opt.scale > 4) {
+        err = "super-resolution scale must be between 1 and 4"; return false;
+    }
+    if (selected.empty() || !std::binary_search(selected.begin(), selected.end(), reference) ||
+        std::adjacent_find(selected.begin(), selected.end(), std::greater_equal<size_t>{}) != selected.end()) {
+        err = "selected frames must be sorted, unique and include the reference"; return false;
+    }
     RawPhoto ref;
     if (!read(reference, ref, err)) return false;
-    std::array<unsigned, 4> colors;
-    std::copy_n(ref.info.cfa, colors.size(), colors.begin());
-    std::sort(colors.begin(), colors.end());
-    if ((ref.width | ref.height) & 1 || colors != std::array<unsigned, 4>{0, 1, 1, 2} ||
-        ref.pixels.size() != size_t(ref.width) * ref.height || ref.black >= ref.white || ref.white > 65535) {
+    if (!valid_photo(ref)) {
         err = "invalid input geometry, Bayer pattern or raw levels"; return false;
     }
     const bool cropped = opt.crop.width != 0;
@@ -1132,16 +1156,14 @@ bool superresolve(const ReadPhoto &read, const std::vector<size_t> &candidates, 
         crop.y > ref.height || crop.height > ref.height - crop.y) {
         err = "crop is outside the reference or smaller than 2 pixels"; return false;
     }
-    if (size_t(crop.width) * crop.height * (opt.linear ? 24 : 8) > UINT32_MAX - (1u << 20)) {
-        err = "output exceeds the DNG writer's 32-bit TIFF limit"; return false;
-    }
-    if (opt.counts.empty() || opt.counts.front() == 0 || opt.counts.back() > candidates.size() ||
-        std::adjacent_find(opt.counts.begin(), opt.counts.end(), std::greater_equal<size_t>{}) != opt.counts.end()) {
-        err = "requested frame count exceeds the selection"; return false;
+    const unsigned output_bytes_per_input = opt.scale * opt.scale * (opt.linear ? 6 : 2);
+    if (uint64_t(crop.width) * crop.height > (UINT32_MAX - (1u << 20)) / output_bytes_per_input) {
+        err = "output exceeds the DNG writer's 32-bit TIFF limit; use a smaller crop or scale"; return false;
     }
     g_threads = std::max(1u, std::thread::hardware_concurrency());
     const auto movie = ref.movie;
     FrameInfo info = ref.info;
+    std::fill(std::begin(info.black_delta), std::end(info.black_delta), 0);
     if (cropped)
         for (unsigned k = 0; k < 4; ++k)
             info.cfa[k] = ref.info.cfa[((k >> 1) ^ (crop.y & 1)) * 2 + ((k & 1) ^ (crop.x & 1))];
@@ -1149,85 +1171,61 @@ bool superresolve(const ReadPhoto &read, const std::vector<size_t> &candidates, 
         auto m = movie;
         m.crop_w = scale * (cropped ? crop.width : movie.crop_w);
         m.crop_h = scale * (cropped ? crop.height : movie.crop_h);
+        m.crop_x = cropped ? 0 : scale * movie.crop_x;
+        m.crop_y = cropped ? 0 : scale * movie.crop_y;
+        m.explicit_crop = cropped || movie.explicit_crop;
+        m.active_x = cropped ? 0 : scale * movie.active_x;
+        m.active_y = cropped ? 0 : scale * movie.active_y;
+        m.active_w = cropped ? 0 : scale * movie.active_w;
+        m.active_h = cropped ? 0 : scale * movie.active_h;
         return m;
     };
-    std::vector<size_t> counts = opt.counts;
-    if (counts.front() == 1) {
-        SrImage single{crop.width, crop.height, ref.black, ref.white, false, {}};
-        single.pixels.resize(size_t(crop.width) * crop.height);
-        for (unsigned y = 0; y < crop.height; ++y)
-            std::copy_n(ref.pixels.data() + size_t(crop.y + y) * ref.width + crop.x, crop.width,
-                        single.pixels.data() + size_t(y) * crop.width);
-        if (!save(1, single, crop_movie(1), info)) return false;
-        counts.erase(counts.begin());
-        if (counts.empty()) return true;
-    }
-
-    auto guide = grey(split(ref.pixels, ref.width, ref.height, float(ref.black), 1, ref.white));
-    auto reference_pyramid = pyramid(guide);
-    auto reference_controls = control_image(std::move(guide));
-    auto points = control_points(reference_controls.fine);
+    std::string frame_list = "selected frames:";
+    for (size_t index : selected) frame_list += " " + std::to_string(index);
+    log(frame_list);
     std::vector<RegisteredPhoto> frames;
-    frames.reserve(counts.back());
-    frames.push_back({reference, std::move(ref), {}, {}, 1});
-
-    // Start with frames spread over the entire selected interval, then try the
-    // remaining candidates if weaker frames could not be aligned.
-    std::vector<size_t> order;
-    const size_t n = counts.back();
-    for (size_t i = 0; i < n; ++i) order.push_back(candidates[i * (candidates.size() - 1) / (n - 1)]);
-    for (size_t i : candidates)
-        if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
-    for (size_t index : order) {
-        if (frames.size() == n) break;
-        if (index == reference) continue;
-        RawPhoto raw;
-        if (!read(index, raw, err)) { log(err + ", skipped"); continue; }
-        const auto &base = frames.front().photo;
-        if (raw.width != base.width || raw.height != base.height || raw.movie.model != base.movie.model ||
-            !std::equal(std::begin(raw.info.cfa), std::end(raw.info.cfa), std::begin(base.info.cfa))) {
-            log("frame " + std::to_string(index) + ": different raw geometry or CFA, skipped");
-            continue;
-        }
-        const float exposure = float(exposure_scale(base.info, raw.info));
-        Img g = grey(split(raw.pixels, raw.width, raw.height, float(raw.black), exposure, raw.white));
-        auto prior = align(reference_pyramid, pyramid(g), 32);
-        auto control = control_image(std::move(g));
-        auto matches = match_controls(reference_controls, control, prior, points);
-        Homography h;
-        size_t inliers = 0;
-        if (!fit_homography(matches, control.fine.w, control.fine.h, h, inliers)) {
-            log("frame " + std::to_string(index) + ": insufficient homography support, skipped");
-            continue;
-        }
-        auto residual = cropped ? refine_crop(reference_controls.fine, control.fine, h, crop) : Position{};
-        auto warp = sensor_map(h, residual);
-        frames.push_back({index, std::move(raw), warp, warp.inverse(), exposure});
-        log("frame " + std::to_string(index) + ": " + std::to_string(inliers) + "/" +
-            std::to_string(matches.size()) + " control points");
-    }
-    if (frames.size() != counts.back()) {
-        err = "aligned " + std::to_string(frames.size()) + " of the requested " + std::to_string(counts.back()) + " frames";
-        return false;
-    }
-    order_by_phase(frames, crop);
-    std::string frame_order = "nested frame order:";
-    for (const auto &frame : frames) frame_order += " " + std::to_string(frame.index);
-    log(frame_order);
-
+    frames.reserve(selected.size());
+    frames.push_back({std::move(ref), {}, {}, 1});
     const auto &base = frames.front().photo;
-    const unsigned scale = 65535 / base.white;
-    std::vector<SrImage> results;
-    for (size_t i = 0; i < counts.size(); ++i) {
-        SrImage out{2 * crop.width, 2 * crop.height, scale * base.black, scale * base.white, opt.linear, {}};
-        out.pixels.resize(size_t(out.width) * out.height * (opt.linear ? 3 : 1));
-        results.push_back(std::move(out));
+
+    if (selected.size() > 1) {
+        auto guide = grey(split(base.pixels, base.width, base.height, float(base.black), 1, base.white, base.info.black_delta));
+        auto reference_pyramid = pyramid(guide);
+        auto reference_controls = control_image(std::move(guide));
+        auto points = control_points(reference_controls.fine);
+
+        for (size_t index : selected) {
+            if (index == reference) continue;
+            RawPhoto raw;
+            if (!read(index, raw, err)) return false;
+            if (!compatible_photos(base, raw)) {
+                err = "frame " + std::to_string(index) + ": incompatible raw geometry, CFA or levels";
+                return false;
+            }
+            const float exposure = float(exposure_scale(base.info, raw.info)) *
+                                   float(base.white - base.black) / float(raw.white - raw.black);
+            Img g = grey(split(raw.pixels, raw.width, raw.height, float(raw.black), exposure, raw.white, raw.info.black_delta));
+            auto prior = align(reference_pyramid, pyramid(g), 32);
+            auto control = control_image(std::move(g));
+            const auto fit = fit_frame_homography(reference_controls, control, prior, points);
+            if (!fit.valid) {
+                err = "frame " + std::to_string(index) + ": insufficient homography support";
+                return false;
+            }
+            auto residual = cropped ? refine_crop(reference_controls.fine, control.fine, fit.model, crop) : Position{};
+            auto warp = sensor_map(fit.model, residual);
+            frames.push_back({std::move(raw), warp, warp.inverse(), exposure});
+            log("frame " + std::to_string(index) + ": " + std::to_string(fit.inliers) + "/" +
+                std::to_string(fit.matched) + " control points");
+        }
     }
-    reconstruct_sr(frames, crop, info, counts, results);
+    const unsigned code_scale = 65535 / base.white;
+    SrImage out{opt.scale * crop.width, opt.scale * crop.height, code_scale * base.black,
+                code_scale * base.white, opt.linear, {}};
+    out.pixels.resize(size_t(out.width) * out.height * (opt.linear ? 3 : 1));
+    reconstruct_sr(frames, crop, info, out, opt.kernel_sigma, int(opt.scale));
     frames.clear();
-    for (size_t i = 0; i < results.size(); ++i)
-        if (!save(counts[i], results[i], crop_movie(2), info)) return false;
-    return true;
+    return save(selected.size(), out, crop_movie(opt.scale), info);
 }
 
 } // namespace nev

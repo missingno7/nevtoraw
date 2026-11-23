@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "io.h"
+#include <fstream>
+#include <random>
+#include <system_error>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace nev {
+FILE *open_file(const std::string &path, const char *mode) {
+#ifdef _WIN32
+    return _wfopen(std::filesystem::u8path(path).c_str(), std::filesystem::path(mode).c_str());
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
+bool write_atomic(const std::filesystem::path &path, const std::vector<uint8_t> &bytes, std::string &err) {
+    namespace fs = std::filesystem;
+    fs::path temporary;
+    try {
+        std::random_device random;
+        do {
+            temporary = path;
+            temporary += "." + std::to_string(random()) + std::to_string(random()) + ".part";
+        } while (fs::exists(temporary));
+        {
+            std::ofstream file(temporary, std::ios::binary);
+            if (!file.write(reinterpret_cast<const char *>(bytes.data()), std::streamsize(bytes.size())))
+                throw std::runtime_error("could not write output");
+            file.close();
+            if (!file) throw std::runtime_error("could not close output");
+        }
+#ifdef _WIN32
+        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            throw std::system_error(int(GetLastError()), std::system_category(), "could not replace output");
+#else
+        fs::rename(temporary, path);
+#endif
+        return true;
+    } catch (const std::exception &e) {
+        std::error_code cleanup;
+        if (!temporary.empty()) fs::remove(temporary, cleanup);
+        err = path.u8string() + ": " + e.what();
+        return false;
+    }
+}
+} // namespace nev

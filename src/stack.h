@@ -3,7 +3,7 @@
 // image, resample each CFA plane separately (Catmull-Rom), then merge into
 // a mosaic raw.
 #pragma once
-#include "nev.h"
+#include "raw.h"
 
 #include <cstdint>
 #include <functional>
@@ -23,10 +23,8 @@ enum class StackAlignment { None, Tiles, Homography };
 struct StackOptions {
     StackMerge merge = StackMerge::Mean;
     unsigned trim_percent = 20; // percentage removed from each tail in TrimmedMean
-    StackAlignment alignment = StackAlignment::Tiles;
+    StackAlignment alignment = StackAlignment::Homography;
     unsigned tile = 32;          // tile size in Bayer-plane pixels (= 2 sensor px)
-    unsigned out_scale = 4;      // output = black*scale + mean*scale (2 extra bits)
-    unsigned white = 16383;      // input white level (clipping threshold is derived)
     unsigned threads = 0;
     float z_lo = 3.0f, z_hi = 5.0f;  // robust weight: 1 below z_lo, 0 above z_hi
 };
@@ -35,13 +33,15 @@ struct StackResult {
     unsigned width = 0, height = 0;
     unsigned black = 0, white = 0;      // output levels (already scaled)
     std::vector<uint16_t> px;
-    Frame ref_frame;                    // metadata source
+    MovieInfo movie;
+    FrameInfo info;
+    std::vector<size_t> frames;
     size_t frames_used = 0;
 };
 
 using StackLog = std::function<void(const std::string &)>;
 
-bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, const StackOptions &opt,
+bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size_t ref, const StackOptions &opt,
                   StackResult &out, std::string &err, const StackLog &log);
 
 } // namespace nev

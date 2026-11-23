@@ -3,13 +3,16 @@
 
 #include "lj92.h"
 #include "tiffw.h"
+#include "version.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <stdexcept>
 
 namespace nev {
 
@@ -25,6 +28,7 @@ const KnownCamera kCameras[] = {
     {"NIKON Z 8", "Nikon Z 8",
      {1.3998, -0.8092, 0.0284, -0.4723, 1.2772, 0.2159, -0.0164, 0.0624, 0.8674},
      {1.1423, -0.4564, -0.1123, -0.4816, 1.2895, 0.2119, -0.0210, 0.1061, 0.7282}, 17, 21, 0.20},
+#include "camera_profiles.inc"
 };
 
 void inv3(const double m[9], double o[9]) {
@@ -66,11 +70,31 @@ std::string add_seconds(const std::string &dt, long add) {
 
 } // namespace
 
+bool has_color_profile(const MovieInfo &mi, const FrameInfo &fi) {
+    if (!mi.profile.empty() || fi.has_matrix) return true;
+    for (const auto &c : kCameras) if (mi.model == c.model) return true;
+    return false;
+}
+
 std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsigned H, const MovieInfo &mi,
                                const FrameInfo &fi, size_t frame_index, const std::string &original_name,
                                const DngOptions &opt) {
     using namespace tiffw;
     const unsigned channels = opt.linear_rgb ? 3 : 1;
+    if (!W || !H || (!opt.linear_rgb && (W < 2 || H < 2)) ||
+        uint64_t(W) * H * channels != px.size()) throw std::runtime_error("invalid output sample geometry");
+    if (opt.black_level >= opt.white_level || opt.white_level > 65535)
+        throw std::runtime_error("invalid output black/white levels");
+    if (!opt.linear_rgb) {
+        std::array<unsigned,4> colors;
+        std::copy_n(fi.cfa,4,colors.begin()); std::sort(colors.begin(),colors.end());
+        if (colors != std::array<unsigned,4>{0,1,1,2}) throw std::runtime_error("invalid output Bayer pattern");
+        for (float delta : fi.black_delta)
+            if (!std::isfinite(delta) || opt.black_level + delta < 0 || opt.black_level + delta >= opt.white_level)
+                throw std::runtime_error("invalid output CFA black level");
+    }
+    if (uint64_t(px.size()) * 2 > UINT32_MAX - (1u << 20))
+        throw std::runtime_error("output exceeds classic TIFF's 4 GiB limit; use a smaller crop or scale");
     std::vector<std::vector<uint8_t>> blobs;
     Ifd raw;
     raw.add_long(0x00fe, {0});
@@ -93,6 +117,7 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         std::vector<std::vector<uint8_t>> tiles(size_t(tx) * ty);
         std::atomic<size_t> next{0};
         unsigned nt = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
+        nt = unsigned(std::min<size_t>(nt, tiles.size()));
         auto work = [&]() {
             std::vector<uint16_t> buf(size_t(T) * T * channels);
             for (size_t k; (k = next++) < tiles.size();) {
@@ -129,10 +154,27 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         raw.add_short(0xc617, {1});
         raw.add_long(0xc62d, {0});  // BayerGreenSplit
     }
-    raw.add_long(0xc61a, std::vector<uint32_t>(channels, opt.black_level));
+    if (!opt.linear_rgb && std::any_of(std::begin(fi.black_delta), std::end(fi.black_delta), [](float v) { return v != 0; })) {
+        raw.add_short(0xc619, {2, 2});
+        std::vector<double> black;
+        for (unsigned k = 0; k < 4; ++k) {
+            unsigned site = ((k / 2 + mi.active_y) & 1) * 2 + ((k % 2 + mi.active_x) & 1);
+            black.push_back(opt.black_level + fi.black_delta[site]);
+        }
+        raw.add_rational(0xc61a, black);
+    } else raw.add_long(0xc61a, std::vector<uint32_t>(channels, opt.black_level));
     raw.add_long(0xc61d, std::vector<uint32_t>(channels, opt.white_level));
     unsigned cw = mi.crop_w && mi.crop_w <= W ? mi.crop_w : W, ch = mi.crop_h && mi.crop_h <= H ? mi.crop_h : H;
     unsigned ox = ((W - cw) / 2) & ~1u, oy = ((H - ch) / 2) & ~1u;
+    if (mi.explicit_crop) { ox = mi.crop_x; oy = mi.crop_y; }
+    if (ox > W || cw > W - ox || oy > H || ch > H - oy) throw std::runtime_error("invalid output crop");
+    if (mi.active_w || mi.active_h) {
+        if (mi.active_x > W || mi.active_w > W - mi.active_x || mi.active_y > H || mi.active_h > H - mi.active_y ||
+            ox < mi.active_x || oy < mi.active_y || cw > mi.active_x + mi.active_w - ox || ch > mi.active_y + mi.active_h - oy)
+            throw std::runtime_error("invalid output active area");
+        raw.add_long(0xc68d, {mi.active_y, mi.active_x, mi.active_y + mi.active_h, mi.active_x + mi.active_w});
+        ox -= mi.active_x; oy -= mi.active_y;
+    }
     raw.add_rational(0xc61f, {{ox, 1}, {oy, 1}});
     raw.add_rational(0xc620, {{cw, 1}, {ch, 1}});
 
@@ -142,7 +184,7 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
     ifd0.add_ascii(0x010f, mi.make);
     ifd0.add_ascii(0x0110, mi.model);
     ifd0.add_short(0x0112, {uint16_t(fi.orientation)});
-    ifd0.add_ascii(0x0131, "nevtoraw 0.1" + (mi.software.empty() ? std::string() : " (" + mi.software + ")"));
+    ifd0.add_ascii(0x0131, "nevtoraw " + std::string(version));
     long secs = mi.fps_num ? long(double(frame_index) * mi.fps_den / mi.fps_num) : 0;
     std::string dt = add_seconds(mi.date_original.empty() ? mi.date_create : mi.date_original, secs);
     if (!dt.empty()) ifd0.add_ascii(0x0132, dt);
@@ -151,7 +193,13 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
 
     const KnownCamera *kc = nullptr;
     for (auto &c : kCameras) if (mi.model == c.model) kc = &c;
-    if (kc) {
+    if (!mi.profile.empty()) {
+        for (const auto &tag : mi.profile) {
+            Entry e;
+            e.tag = tag.tag; e.type = Type(tag.type); e.count = tag.count; e.data = tag.data;
+            ifd0.entries.push_back(std::move(e));
+        }
+    } else if (kc) {
         ifd0.add_ascii(0xc614, kc->unique);
         ifd0.add_srational(0xc621, std::vector<double>(kc->cm1, kc->cm1 + 9));
         ifd0.add_srational(0xc622, std::vector<double>(kc->cm2, kc->cm2 + 9));
@@ -159,6 +207,7 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         ifd0.add_short(0xc65b, {uint16_t(kc->illum2)});
         ifd0.add_srational(0xc62a, std::vector<double>{kc->baseline_exposure}, 100);
     } else {
+        if (!fi.has_matrix) throw std::runtime_error("no color calibration for " + mi.model + "; convert the NEF to Bayer DNG first");
         // Fallback: the camera's own (white-balanced RGB -> XYZ D65) matrix for this frame,
         // as a single ColorMatrix for the scene illuminant.
         std::string u = mi.model;

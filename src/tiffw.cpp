@@ -45,7 +45,13 @@ void Ifd::add_rational(uint16_t tag, const std::vector<std::pair<uint32_t, uint3
 }
 void Ifd::add_rational(uint16_t tag, const std::vector<double> &v, uint32_t den) {
     std::vector<std::pair<uint32_t, uint32_t>> r;
-    for (double x : v) r.push_back({uint32_t(std::lround(x * den)), den});
+    for (double x : v) {
+        if (!std::isfinite(x) || x < 0 || x > UINT32_MAX || !den)
+            throw std::runtime_error("invalid unsigned TIFF rational");
+        uint32_t divisor = den;
+        while (x * divisor > UINT32_MAX && divisor > 1) divisor = std::max(1u, divisor / 10);
+        r.push_back({uint32_t(std::llround(x * divisor)), divisor});
+    }
     add_rational(tag, r);
 }
 void Ifd::add_srational(uint16_t tag, const std::vector<std::pair<int32_t, int32_t>> &v) {
@@ -55,7 +61,13 @@ void Ifd::add_srational(uint16_t tag, const std::vector<std::pair<int32_t, int32
 }
 void Ifd::add_srational(uint16_t tag, const std::vector<double> &v, int32_t den) {
     std::vector<std::pair<int32_t, int32_t>> r;
-    for (double x : v) r.push_back({int32_t(std::lround(x * den)), den});
+    for (double x : v) {
+        if (!std::isfinite(x) || std::abs(x) > INT32_MAX || den < 1)
+            throw std::runtime_error("invalid signed TIFF rational");
+        int32_t divisor = den;
+        while (std::abs(x * divisor) > INT32_MAX && divisor > 1) divisor = std::max(1, divisor / 10);
+        r.push_back({int32_t(std::llround(x * divisor)), divisor});
+    }
     add_srational(tag, r);
 }
 void Ifd::add_float(uint16_t tag, const std::vector<float> &v) {

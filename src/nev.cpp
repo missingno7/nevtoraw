@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "nev.h"
+#include "he_decode.h"
+#include "io.h"
 
 #include <cstring>
 
@@ -56,7 +58,10 @@ unsigned black_level(const Frame &fr) {
 File::~File() { if (fp) fclose(fp); }
 
 bool File::open(const std::string &path, std::string &err) {
-    fp = fopen(path.c_str(), "rb");
+    if (fp) { fclose(fp); fp = nullptr; }
+    offsets.clear(); sizes.clear(); durations.clear(); ncdt.clear();
+    width = height = timescale = 0;
+    fp = open_file(path, "rb");
     if (!fp) { err = "cannot open " + path; return false; }
     _fseeki64(fp, 0, SEEK_END); size = uint64_t(_ftelli64(fp));
     // find moov at top level
@@ -165,6 +170,11 @@ bool File::read_frame(size_t i, Frame &f, std::string &err) const {
     f.bits = 14;
     if (auto *b = f.find(0x0110, 0x0102); b && b->value.size() >= 3) f.bits = b->value[2];
     return true;
+}
+
+bool decode_frame(const File &file, size_t index, Frame &frame, std::vector<uint16_t> &pixels, std::string &err) {
+    return file.read_frame(index, frame, err) &&
+           nefcomp::he_decode(frame.codestream(), frame.cs_len, frame.width, frame.height, pixels, err);
 }
 
 } // namespace nev

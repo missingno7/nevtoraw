@@ -45,4 +45,7 @@ struct File {
     bool read_frame(size_t i, Frame &f, std::string &err) const;
 };
 
+// Read and decode one video frame while retaining its metadata.
+bool decode_frame(const File &file, size_t index, Frame &frame, std::vector<uint16_t> &pixels, std::string &err);
+
 } // namespace nev

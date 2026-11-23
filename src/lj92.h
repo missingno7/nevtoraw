@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <string>
 
 namespace lj92 {
 
@@ -11,5 +12,9 @@ namespace lj92 {
 // left predictor sees the same colour. w must be even.
 std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits);
 std::vector<uint8_t> encode_rgb_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits);
+
+// Decode an interleaved SOF3 tile. max_samples bounds allocation from untrusted headers.
+bool decode_tile(const uint8_t *data, size_t length, size_t max_samples, std::vector<uint16_t> &samples,
+                 std::string &err);
 
 } // namespace lj92

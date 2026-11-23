@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
-#include "nef.h"
+#include "raw.h"
 #include "stack.h"
 
 namespace nev {
@@ -12,8 +12,9 @@ struct SrCrop {
 
 struct SrOptions {
     SrCrop crop;
-    std::vector<size_t> counts;
     bool linear = true;
+    float kernel_sigma = 0.30f; // Gaussian width in input sensor pixels
+    unsigned scale = 2;        // Output pixels per input sensor pixel, on each axis
 };
 
 struct SrImage {
@@ -22,12 +23,10 @@ struct SrImage {
     std::vector<uint16_t> pixels;
 };
 
-using ReadPhoto = std::function<bool(size_t, RawPhoto &, std::string &)>;
 using SaveSr = std::function<bool(size_t, const SrImage &, const MovieInfo &, const FrameInfo &)>;
 
-// Reconstruct at 2x from original CFA samples. A requested count of 1
-// exports the reference mosaic on its native grid for comparison.
-bool superresolve(const ReadPhoto &read, const std::vector<size_t> &candidates, size_t reference,
+// Reconstruct one image from the selected frames, including the reference.
+bool superresolve(const ReadPhoto &read, const std::vector<size_t> &frames, size_t reference,
                   const SrOptions &opt, const SaveSr &save, std::string &err, const StackLog &log);
 
 } // namespace nev

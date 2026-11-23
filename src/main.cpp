@@ -1,100 +1,87 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // nevtoraw: extract frames of Nikon N-RAW (.NEV) video as DNG raw stills.
 #include "dng.h"
-#include "he_decode.h"
+#include "input.h"
+#include "io.h"
+#include "selection.h"
+#include "version.h"
 #include "meta.h"
 #include "nev.h"
 #include "sr.h"
 #include "stack.h"
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <set>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
-static void usage() {
-    fprintf(stderr,
-            "nevtoraw [dng] <file.NEV> [options]   extract frames as DNG (dng is the default)\n"
-            "nevtoraw dng <file.NEF> [options]    convert one Nikon Z 8 NEF to Bayer DNG\n"
-            "nevtoraw stack <file.NEV> [options]   align and average frames into one low-noise DNG\n"
-            "nevtoraw sr <NEF-folder|file.NEV>    reconstruct a 2x LinearRaw DNG\n"
-            "nevtoraw info <file.NEV|file.NEF>    show raw geometry and exposure\n"
+static void usage(FILE *stream = stderr) {
+    fprintf(stream,
+            "nevtoraw [dng] <raw-folder|NEV|NEF|DNG> export Bayer frames (default command)\n"
+            "nevtoraw stack <raw-folder|NEV|NEF|DNG> align and merge a Bayer DNG\n"
+            "nevtoraw sr <raw-folder|NEV|NEF|DNG> reconstruct a LinearRaw DNG\n"
+            "nevtoraw info <raw-folder|NEV|NEF|DNG> show source details and folder indices\n"
+            "  -h, --help         show this help; accepted after a command too\n"
+            "      --version      show program version\n"
             "  -f, --frames LIST   frames: 0 | 0-10 | 0,12,50 | 0-143:6 | all\n"
-            "                      (default: 0 for dng, 0-15 for stack, all candidates for sr)\n"
-            "  -o, --output DIR    output directory (default: next to the NEV)\n"
+            "                      (default: 0 for dng, all for stack and sr)\n"
+            "  -o, --output DIR    output directory (file: beside source; folder: SOURCE/nevtoraw)\n"
             "  -c, --compression C ljpeg (default, lossless) | none\n"
-            "      --white N       white level (default 16383)\n"
-            "  -r, --ref N         reference frame for stack or sr (default: middle of the list)\n"
+            "      --white N       override source white level (NEV default 16383)\n"
+            "  -r, --ref N         reference frame for stack or sr (default: middle of selected frames)\n"
+            "  stack and sr:\n"
+            "      --count N|all   use N frames spread across --frames, or every selected frame\n"
+            "                      (sr default: up to 16; stack: every selected frame)\n"
             "  sr only:\n"
-            "      --counts LIST   frame counts, e.g. 1,4,8,16,32 (default: up to 16)\n"
-            "                      count 1 saves the original reference mosaic at native size\n"
             "      --crop X,Y,W,H  region in reference sensor pixels\n"
-            "      --bayer         export 2x Bayer DNG instead of LinearRaw\n"
+            "      --scale N       output magnification per axis (1 to 4; default: 2)\n"
+            "      --kernel-sigma N  Gaussian width in input sensor pixels (default: 0.30)\n"
+            "      --bayer         export a Bayer DNG\n"
             "  stack only:\n"
             "      --merge M       mean (default, robust weighted) | median | trimmed-mean\n"
-            "                      median and trimmed-mean store 2 bytes per sensor pixel per frame\n"
+            "                      median/trimmed-mean store 2 bytes/pixel/frame (4 for 16-bit DNG)\n"
             "      --trim-percent N  discard N%% from each tail in trimmed-mean (0..49, default 20)\n"
-            "      --align MODE    tiles (default) or homography (global perspective)\n"
+            "      --align MODE    homography (default, global perspective) or tiles\n"
             "      --no-align      average without alignment (tripod)\n"
             "      --tile N        alignment tile size in sensor pixels (default 64)\n");
 }
 
-static bool nef_path(const fs::path &path) {
-    auto ext = path.extension().string();
-    for (char &c : ext) if (c >= 'A' && c <= 'Z') c = char(c + ('a' - 'A'));
-    return ext == ".nef";
-}
-
-static bool parse_csv(const std::string &s, std::vector<size_t> &values) {
-    const char *p = s.data(), *end = p + s.size();
-    while (p < end) {
+static bool parse_csv(std::string_view s, std::vector<size_t> &values) {
+    while (!s.empty()) {
+        const size_t comma = s.find(',');
         size_t value;
-        auto result = std::from_chars(p, end, value);
-        if (result.ec != std::errc{}) return false;
+        if (!nev::parse_number(s.substr(0, comma), value)) return false;
         values.push_back(value);
-        p = result.ptr;
-        if (p == end) return true;
-        if (*p++ != ',') return false;
+        if (comma == s.npos) return true;
+        s.remove_prefix(comma + 1);
     }
     return false;
 }
 
-static bool parse_frames(const std::string &s, size_t n, std::vector<size_t> &out) {
-    std::set<size_t> set;
-    if (s == "all") { for (size_t i = 0; i < n; i++) set.insert(i); }
-    else {
-        size_t p = 0;
-        while (p < s.size()) {
-            size_t e = s.find(',', p); if (e == std::string::npos) e = s.size();
-            std::string part = s.substr(p, e - p);
-            size_t a, b, step = 1;
-            char c1 = 0;
-            if (sscanf(part.c_str(), "%zu-%zu:%zu", &a, &b, &step) == 3 ||
-                sscanf(part.c_str(), "%zu-%zu", &a, &b) == 2) {
-                if (!step) return false;
-                for (size_t i = a; i <= b && i < n; i += step) set.insert(i);
-            } else if (sscanf(part.c_str(), "%zu%c", &a, &c1) == 1) {
-                if (a < n) set.insert(a);
-            } else return false;
-            p = e + 1;
-        }
-    }
-    out.assign(set.begin(), set.end());
-    return !out.empty();
-}
-
 static int cmd_info(const std::string &path) {
-    if (nef_path(fs::u8path(path))) {
+    if (fs::is_directory(fs::u8path(path))) {
+        nev::InputSource source;
+        nev::RawPhoto photo;
+        std::string err;
+        if (!source.open(fs::u8path(path), err) || !source.read(0, photo, err)) {
+            fprintf(stderr, "%s\n", err.c_str()); return 1;
+        }
+        printf("%s %s, %ux%u coded, %zu files sorted by filename\n", photo.movie.make.c_str(),
+               photo.movie.model.c_str(), photo.width, photo.height, source.size());
+        for (size_t i = 0; i < source.size(); ++i) printf("%6zu  %s\n", i, source.name(i).c_str());
+        return 0;
+    }
+    if (nev::raw_photo_path(fs::u8path(path))) {
         nev::RawPhoto p;
         std::string err;
-        if (!nev::read_nef(path, p, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!nev::read_raw_photo(path, p, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         printf("%s %s, %ux%u coded, %ux%u output\n", p.movie.make.c_str(), p.movie.model.c_str(),
                p.width, p.height, p.movie.crop_w, p.movie.crop_h);
         printf("ISO %u, %.6g s, f/%.1f, %.1f mm, black %u, white %u\n", p.info.iso,
@@ -121,86 +108,134 @@ static int cmd_info(const std::string &path) {
     return 0;
 }
 
-static bool write_file(const fs::path &out, const std::vector<uint8_t> &data) {
-    FILE *o = fopen(out.string().c_str(), "wb");
-    bool ok = o && fwrite(data.data(), 1, data.size(), o) == data.size();
-    if (o && fclose(o)) ok = false;
-    if (!ok) fprintf(stderr, "write %s failed\n", out.string().c_str());
-    return ok;
+static bool write_file(const nev::InputSource &source, const fs::path &out, const std::vector<uint8_t> &data) {
+    std::string err;
+    if (source.contains(out)) err = out.u8string() + ": output would overwrite a source file; choose another output directory";
+    else if (nev::write_atomic(out, data, err)) return true;
+    fprintf(stderr, "%s\n", err.c_str());
+    return false;
 }
 
-static int cmd_sr(const fs::path &input, const fs::path &output, const std::string &frames, long requested_ref,
-                  nev::SrOptions sr, nev::DngOptions dng, bool white_given) {
-    std::vector<fs::path> photos;
-    const bool directory = fs::is_directory(input);
-    nev::File video;
-    nev::MovieInfo video_meta;
+static int cmd_convert(const fs::path &input, const fs::path &output, const std::string &frames,
+                       nev::DngOptions options, bool white_given) {
+    nev::InputSource source;
     std::string err;
-    size_t available = 0;
-    if (directory || nef_path(input)) {
-        if (directory) {
-            for (const auto &entry : fs::directory_iterator(input))
-                if (entry.is_regular_file() && nef_path(entry.path())) photos.push_back(entry.path());
-        } else photos.push_back(input);
-        std::sort(photos.begin(), photos.end());
-        available = photos.size();
-    } else {
-        if (!video.open(input.string(), err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-        available = video.frame_count();
-        video_meta = nev::movie_info(video);
-    }
+    if (!source.open(input, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
     std::vector<size_t> selected;
-    if (!parse_frames(frames, available, selected)) { fprintf(stderr, "no frames selected\n"); return 2; }
-    size_t ref = requested_ref >= 0 ? size_t(requested_ref) : selected[selected.size() / 2];
-    if (!std::binary_search(selected.begin(), selected.end(), ref)) {
-        fprintf(stderr, "reference must be included in the frame selection\n");
-        return 2;
-    }
-    if (sr.counts.empty()) sr.counts.push_back(std::min<size_t>(16, selected.size()));
-    if (sr.counts.front() == 0 || sr.counts.back() > selected.size()) {
-        fprintf(stderr, "counts must be between 1 and the number of selected frames (%zu)\n", selected.size());
-        return 2;
-    }
-    if (white_given && (dng.white_level == 0 || dng.white_level > 65535)) {
-        fprintf(stderr, "white level must be between 1 and 65535\n"); return 2;
-    }
-    auto read = [&](size_t index, nev::RawPhoto &p, std::string &read_error) {
-        if (!photos.empty()) {
-            if (!nev::read_nef(photos[index].u8string(), p, read_error)) return false;
+    if (!nev::parse_frames(frames, source.size(), selected)) { fprintf(stderr, "invalid or empty frame selection\n"); return 2; }
+    const auto directory = output.empty() ? source.output_directory() : output;
+    if (!directory.empty()) fs::create_directories(directory);
+    int failed = 0;
+    for (size_t index : selected) {
+        const auto start = std::chrono::steady_clock::now();
+        nev::RawPhoto photo;
+        if (!source.read(index, photo, err)) { fprintf(stderr, "frame %zu: %s\n", index, err.c_str()); ++failed; continue; }
+        const auto name = source.name(index);
+        std::string suffix;
+        if (source.is_video()) {
+            char buffer[32]; std::snprintf(buffer, sizeof buffer, "_%05zu", index); suffix = buffer;
         } else {
-            nev::Frame frame;
-            if (!video.read_frame(index, frame, read_error) ||
-                !nefcomp::he_decode(frame.codestream(), frame.cs_len, frame.width, frame.height, p.pixels, read_error))
-                return false;
-            p.width = frame.width; p.height = frame.height; p.black = nev::black_level(frame);
-            p.info = nev::frame_info(frame); p.movie = video_meta;
+            auto ext = fs::u8path(name).extension().u8string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            if (ext == ".dng") suffix = "_converted";
         }
+        const auto destination = directory / fs::u8path(fs::u8path(name).stem().u8string() + suffix + ".dng");
+        options.black_level = photo.black;
+        if (!white_given) options.white_level = photo.white;
+        auto bytes = nev::build_dng(photo.pixels, photo.width, photo.height, photo.movie, photo.info,
+                                   source.metadata_index(index), name, options);
+        if (!write_file(source, destination, bytes)) { ++failed; continue; }
+        printf("%s  %.1f MB  %.1f s\n", destination.u8string().c_str(), bytes.size()/1e6,
+               std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
+    }
+    return failed ? 1 : 0;
+}
+
+static int cmd_merge(const fs::path &input, const fs::path &output, const std::string &frames,
+                  std::optional<size_t> requested_ref, std::optional<size_t> requested_count,
+                  nev::SrOptions sr, nev::StackOptions stack, nev::DngOptions dng, bool white_given, bool superresolution) {
+    nev::InputSource source;
+    std::string err;
+    if (!source.open(input, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    nev::FrameSelection selection;
+    if (!nev::select_frames(frames, source.size(), requested_count, requested_ref, superresolution ? 16 : 0, selection, err)) {
+        fprintf(stderr, "%s\n", err.c_str()); return 2;
+    }
+    const auto &selected = selection.frames;
+    const size_t ref = selection.reference;
+    auto read = [&](size_t index, nev::RawPhoto &p, std::string &read_error) {
+        if (!source.read(index, p, read_error)) return false;
         if (white_given) p.white = dng.white_level;
         if (p.white <= p.black) { read_error = "white level must exceed black level"; return false; }
+        if (!nev::has_color_profile(p.movie, p.info)) {
+            read_error = "no color calibration for " + p.movie.model + "; convert to Bayer DNG first";
+            return false;
+        }
         return true;
     };
-    fs::path outdir = output.empty() ? (directory ? input : input.parent_path()) : output;
+    fs::path outdir = output.empty() ? source.output_directory() : output;
     if (!outdir.empty()) fs::create_directories(outdir);
-    auto source_name = photos.empty() ? input.filename().u8string() : photos[ref].filename().u8string();
+    auto source_name = source.name(ref);
     auto stem = fs::u8path(source_name).stem().u8string();
-    printf("reference %zu (%s), %zu candidates\n", ref, source_name.c_str(), selected.size());
+    printf("using %zu of %zu candidates, reference %zu (%s)\n", selected.size(), selection.candidates, ref, source_name.c_str());
+    auto log = [](const std::string &s) { printf("  %s\n", s.c_str()); };
     const auto t0 = std::chrono::steady_clock::now();
+    if (!superresolution) {
+        std::string frame_list = "selected frames:";
+        for (size_t index : selected) frame_list += " " + std::to_string(index);
+        log(frame_list);
+        const bool trimmed = stack.merge == nev::StackMerge::TrimmedMean;
+        const bool median = stack.merge == nev::StackMerge::Median;
+        const std::string merge = trimmed ? "trimmed mean" : median ? "median" : "mean";
+        const std::string alignment = stack.alignment == nev::StackAlignment::None ? "no alignment" :
+                                      stack.alignment == nev::StackAlignment::Homography ? "homography alignment" : "tile alignment";
+        printf("%s stack, %s\n", merge.c_str(), alignment.c_str());
+        nev::StackResult result;
+        if (!nev::stack_frames(read, selected, ref, stack, result, err, log)) {
+            fprintf(stderr, "%s\n", err.c_str()); return 1;
+        }
+        dng.black_level = result.black; dng.white_level = result.white;
+        dng.description = "nevtoraw " + merge + " stack of " + std::to_string(result.frames_used) +
+                          " frames, reference " + std::to_string(ref) + ", " + alignment;
+        if (trimmed) dng.description += ", trim " + std::to_string(stack.trim_percent) + "% per tail";
+        dng.description += ", frames";
+        std::sort(result.frames.begin(), result.frames.end());
+        for (size_t index : result.frames) dng.description += " " + std::to_string(index);
+        const std::string suffix = trimmed ? "trimmed" + std::to_string(stack.trim_percent) : median ? "median" : "stack";
+        char name[96];
+        std::snprintf(name, sizeof name, "_%s_%05zu-%05zu.dng", suffix.c_str(), selected.front(), selected.back());
+        // Keep the video stem for existing stack filenames; still bursts use the reference filename.
+        const auto dest = outdir / fs::u8path(stem + name);
+        auto bytes = nev::build_dng(result.px, result.width, result.height, result.movie, result.info,
+                                   source.metadata_index(ref), source_name, dng);
+        if (!write_file(source, dest, bytes)) return 1;
+        printf("%s  %.1f MB  %.1f s\n", dest.u8string().c_str(), bytes.size()/1e6,
+               std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count());
+        return 0;
+    }
+    char kernel[80];
+    std::snprintf(kernel, sizeof kernel, "kernel sigma %.6g sensor px", double(sr.kernel_sigma));
+    printf("%ux output, %s\n", sr.scale, kernel);
+    const std::string output_scale = std::to_string(sr.scale) + "x";
     auto save = [&](size_t count, const nev::SrImage &image, const nev::MovieInfo &movie, const nev::FrameInfo &info) {
         dng.black_level = image.black; dng.white_level = image.white;
         dng.linear_rgb = image.linear;
-        const char *format = count == 1 ? "native Bayer" : image.linear ? "2x LinearRaw" : "2x Bayer";
-        dng.description = "nevtoraw " + std::string(format) + ", " + std::to_string(count) +
+        const std::string format = output_scale + (image.linear ? " LinearRaw" : " Bayer");
+        dng.description = "nevtoraw " + format + ", " + std::to_string(count) +
                           " frame(s), reference " + std::to_string(ref);
-        const std::string suffix = count == 1 ? "_native_1" : (image.linear ? "_sr2x_linear_" : "_sr2x_bayer_") +
-                                                             std::to_string(count);
+        dng.description += ", " + std::string(kernel);
+        dng.description += ", frames";
+        for (size_t index : selected) dng.description += " " + std::to_string(index);
+        const std::string suffix = "_sr" + output_scale +
+            (image.linear ? "_linear_" : "_bayer_") + std::to_string(count);
         const auto path = outdir / fs::u8path(stem + suffix + ".dng");
         auto bytes = nev::build_dng(image.pixels, image.width, image.height, movie, info,
-                                    photos.empty() ? ref : 0, source_name, dng);
-        if (!write_file(path, bytes)) { err = "could not save " + path.u8string(); return false; }
-        printf("%s  %.1f MB\n", path.string().c_str(), bytes.size() / 1e6);
+                                    source.metadata_index(ref), source_name, dng);
+        if (!write_file(source, path, bytes)) { err = "could not save " + path.u8string(); return false; }
+        printf("%s  %.1f MB\n", path.u8string().c_str(), bytes.size() / 1e6);
         return true;
     };
-    if (!nev::superresolve(read, selected, ref, sr, save, err, [](const std::string &s) { printf("  %s\n", s.c_str()); })) {
+    if (!nev::superresolve(read, selected, ref, sr, save, err, log)) {
         fprintf(stderr, "%s\n", err.c_str());
         return 1;
     }
@@ -208,9 +243,12 @@ static int cmd_sr(const fs::path &input, const fs::path &output, const std::stri
     return 0;
 }
 
-int main(int argc, char **argv) {
+static int run(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
     std::string cmd = argv[1];
+    for (int i = 1; i < argc; ++i)
+        if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") { usage(stdout); return 0; }
+    if (cmd == "--version") { printf("nevtoraw %s\n", std::string(nev::version).c_str()); return 0; }
     if (cmd == "info") {
         if (argc != 3) { usage(); return 2; }
         return cmd_info(argv[2]);
@@ -227,12 +265,12 @@ int main(int argc, char **argv) {
         usage(); return 2;
     }
     std::string path = argv[first - 1];
-    std::string frames = sr ? "all" : stack ? "0-15" : "0", outdir;
-    long ref = -1;
+    std::string frames = (sr || stack) ? "all" : "0", outdir;
+    std::optional<size_t> ref, count;
     nev::DngOptions opt;
     nev::StackOptions sopt;
     nev::SrOptions sr_opt;
-    bool trim_given = false, white_given = false;
+    bool trim_given = false, white_given = false, align_given = false, no_align_given = false, tile_given = false;
     for (int i = first; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
@@ -244,14 +282,25 @@ int main(int argc, char **argv) {
             else if (c == "ljpeg") opt.compression = nev::DngCompression::LosslessJpeg;
             else { usage(); return 2; }
         } else if (a == "--white") {
-            opt.white_level = sopt.white = unsigned(atoi(next().c_str()));
+            size_t value;
+            if (!nev::parse_number(next(), value) || value == 0 || value > 65535) {
+                fprintf(stderr, "--white must be an integer from 1 to 65535\n"); return 2;
+            }
+            opt.white_level = unsigned(value);
             white_given = true;
-        } else if ((stack || sr) && (a == "-r" || a == "--ref")) ref = atol(next().c_str());
-        else if (sr && a == "--counts") {
-            sr_opt.counts.clear();
-            if (!parse_csv(next(), sr_opt.counts)) { fprintf(stderr, "bad frame counts\n"); return 2; }
-            std::sort(sr_opt.counts.begin(), sr_opt.counts.end());
-            sr_opt.counts.erase(std::unique(sr_opt.counts.begin(), sr_opt.counts.end()), sr_opt.counts.end());
+        } else if ((stack || sr) && (a == "-r" || a == "--ref")) {
+            size_t value;
+            if (!nev::parse_number(next(), value)) { fprintf(stderr, "--ref must be a frame number\n"); return 2; }
+            ref = value;
+        } else if ((stack || sr) && a == "--count") {
+            const auto value = next();
+            size_t number = 0;
+            if (value != "all" && (!nev::parse_number(value, number) || number == 0)) {
+                fprintf(stderr, "--count must be a positive integer or all\n"); return 2;
+            }
+            count = number;
+        } else if ((stack || sr) && a == "--counts") {
+            fprintf(stderr, "use --count N|all to reconstruct one image per run\n"); return 2;
         } else if (sr && a == "--crop") {
             std::vector<size_t> values;
             if (!parse_csv(next(), values) || values.size() != 4 || values[2] == 0 || values[3] == 0 ||
@@ -259,9 +308,27 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "crop must be X,Y,W,H\n"); return 2;
             }
             sr_opt.crop = {unsigned(values[0]), unsigned(values[1]), unsigned(values[2]), unsigned(values[3])};
+        } else if (sr && a == "--scale") {
+            const std::string value = next();
+            size_t scale;
+            if (!nev::parse_number(value, scale) || scale < 1 || scale > 4) {
+                fprintf(stderr, "--scale must be an integer from 1 to 4\n");
+                return 2;
+            }
+            sr_opt.scale = unsigned(scale);
+        } else if (sr && a == "--kernel-sigma") {
+            const std::string value = next();
+            char *end;
+            float sigma = std::strtof(value.c_str(), &end);
+            if (end == value.c_str() || *end || !std::isfinite(sigma) || sigma <= 0) {
+                fprintf(stderr, "--kernel-sigma must be a finite positive number\n");
+                return 2;
+            }
+            sr_opt.kernel_sigma = sigma;
         } else if (sr && a == "--bayer") sr_opt.linear = false;
-        else if (stack && a == "--no-align") sopt.alignment = nev::StackAlignment::None;
+        else if (stack && a == "--no-align") { sopt.alignment = nev::StackAlignment::None; no_align_given = true; }
         else if (stack && a == "--align") {
+            align_given = true;
             std::string mode = next();
             if (mode == "tiles") sopt.alignment = nev::StackAlignment::Tiles;
             else if (mode == "homography") sopt.alignment = nev::StackAlignment::Homography;
@@ -273,19 +340,20 @@ int main(int argc, char **argv) {
             else if (m == "trimmed-mean") sopt.merge = nev::StackMerge::TrimmedMean;
             else { usage(); return 2; }
         } else if (stack && a == "--trim-percent") {
-            std::string value = next();
-            char *end;
-            long percent = strtol(value.c_str(), &end, 10);
-            if (value.empty() || *end || percent < 0 || percent > 49) {
+            size_t percent;
+            if (!nev::parse_number(next(), percent) || percent > 49) {
                 fprintf(stderr, "--trim-percent must be an integer from 0 to 49\n");
                 return 2;
             }
             sopt.trim_percent = unsigned(percent);
             trim_given = true;
         } else if (stack && a == "--tile") {
-            int t = atoi(next().c_str());
-            if (t < 16 || t > 512 || (t & 1)) { fprintf(stderr, "--tile must be an even number 16..512\n"); return 2; }
+            size_t t;
+            if (!nev::parse_number(next(), t) || t < 16 || t > 512 || (t & 1)) {
+                fprintf(stderr, "--tile must be an even number 16..512\n"); return 2;
+            }
             sopt.tile = unsigned(t / 2);
+            tile_given = true;
         } else { usage(); return 2; }
     }
     const bool trimmed = sopt.merge == nev::StackMerge::TrimmedMean;
@@ -293,84 +361,27 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--trim-percent requires --merge trimmed-mean\n");
         return 2;
     }
-    if (sr) return cmd_sr(fs::u8path(path), fs::u8path(outdir), frames, ref, sr_opt, opt, white_given);
-    if (!stack && nef_path(fs::u8path(path))) {
-        if (frames != "0" && frames != "all") { fprintf(stderr, "a NEF only has frame 0\n"); return 2; }
-        nev::RawPhoto p;
-        std::string err;
-        if (!nev::read_nef(path, p, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-        const fs::path in = fs::u8path(path);
-        const fs::path dir = outdir.empty() ? in.parent_path() : fs::u8path(outdir);
-        if (!dir.empty()) fs::create_directories(dir);
-        opt.black_level = p.black;
-        if (!white_given) opt.white_level = p.white;
-        const auto dest = dir / (in.stem().string() + ".dng");
-        auto data = nev::build_dng(p.pixels, p.width, p.height, p.movie, p.info, 0, in.filename().u8string(), opt);
-        if (!write_file(dest, data)) return 1;
-        printf("%s  %.1f MB\n", dest.string().c_str(), data.size() / 1e6);
-        return 0;
+    if (no_align_given && (align_given || tile_given)) {
+        fprintf(stderr, "--no-align cannot be combined with --align or --tile\n"); return 2;
     }
-    nev::File f; std::string err;
-    if (!f.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-    auto mi = nev::movie_info(f);
-    std::vector<size_t> list;
-    if (!parse_frames(frames, f.frame_count(), list)) { fprintf(stderr, "bad frame list\n"); return 2; }
-    fs::path in(path);
-    fs::path dir = outdir.empty() ? in.parent_path() : fs::path(outdir);
-    if (!dir.empty()) fs::create_directories(dir);
-    std::string stem = in.stem().string();
-
-    if (stack) {
-        size_t r = ref >= 0 ? size_t(ref) : list[list.size() / 2];
-        if (r >= f.frame_count()) { fprintf(stderr, "reference frame out of range\n"); return 2; }
-        auto t0 = std::chrono::steady_clock::now();
-        const bool med = sopt.merge == nev::StackMerge::Median;
-        const char *merge = trimmed ? "trimmed mean" : med ? "median" : "mean";
-        const std::string trim = trimmed ? ", trim " + std::to_string(sopt.trim_percent) + "% per tail" : "";
-        const bool unaligned = sopt.alignment == nev::StackAlignment::None;
-        const bool projective = sopt.alignment == nev::StackAlignment::Homography;
-        const char *alignment = projective ? ", homography alignment" : "";
-        printf("%s-stacking %zu frames (%zu-%zu), reference %zu%s%s\n", merge, list.size(), list.front(),
-               list.back(), r, unaligned ? ", no alignment" : alignment, trim.c_str());
-        nev::StackResult res;
-        if (!nev::stack_frames(f, list, r, sopt, res, err, [](const std::string &s) { printf("  %s\n", s.c_str()); })) {
-            fprintf(stderr, "%s\n", err.c_str()); return 1;
-        }
-        auto fi = nev::frame_info(res.ref_frame);
-        opt.black_level = res.black;
-        opt.white_level = res.white;
-        char desc[160];
-        snprintf(desc, sizeof desc, "nevtoraw %s stack of %zu frames (%zu-%zu), reference %zu%s%s", merge,
-                 res.frames_used, list.front(), list.back(), r, unaligned ? ", not aligned" : alignment, trim.c_str());
-        opt.description = desc;
-        auto dng = nev::build_dng(res.px, res.width, res.height, mi, fi, r, in.filename().string(), opt);
-        char name[64];
-        const std::string suffix = trimmed ? "trimmed" + std::to_string(sopt.trim_percent) : med ? "median" : "stack";
-        snprintf(name, sizeof name, "_%s_%05zu-%05zu.dng", suffix.c_str(), list.front(), list.back());
-        fs::path out = dir / (stem + name);
-        if (!write_file(out, dng)) return 1;
-        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        printf("%s  %.1f MB  %.1f s\n", out.string().c_str(), dng.size() / 1e6, s);
-        return 0;
-    }
-
-    int failed = 0;
-    for (size_t idx : list) {
-        auto t0 = std::chrono::steady_clock::now();
-        nev::Frame fr;
-        std::vector<uint16_t> px;
-        if (!f.read_frame(idx, fr, err) || !nefcomp::he_decode(fr.codestream(), fr.cs_len, fr.width, fr.height, px, err)) {
-            fprintf(stderr, "frame %zu: %s\n", idx, err.c_str()); failed++; continue;
-        }
-        auto fi = nev::frame_info(fr);
-        opt.black_level = nev::black_level(fr);
-        auto dng = nev::build_dng(px, fr.width, fr.height, mi, fi, idx, in.filename().string(), opt);
-        char name[64];
-        snprintf(name, sizeof name, "_%05zu.dng", idx);
-        fs::path out = dir / (stem + name);
-        if (!write_file(out, dng)) { failed++; continue; }
-        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        printf("%s  %.1f MB  %.0f ms\n", out.string().c_str(), dng.size() / 1e6, ms);
-    }
-    return failed ? 1 : 0;
+    if (sr || stack) return cmd_merge(fs::u8path(path), fs::u8path(outdir), frames, ref, count, sr_opt, sopt, opt, white_given, sr);
+    return cmd_convert(fs::u8path(path), fs::u8path(outdir), frames, opt, white_given);
 }
+
+static int guarded_run(int argc, char **argv) {
+    try { return run(argc, argv); }
+    catch (const std::exception &e) { fprintf(stderr, "%s\n", e.what()); return 1; }
+}
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t **argv) {
+    std::vector<std::string> arguments;
+    arguments.reserve(size_t(argc));
+    for (int i = 0; i < argc; ++i) arguments.push_back(fs::path(argv[i]).u8string());
+    std::vector<char *> utf8;
+    for (auto &argument : arguments) utf8.push_back(argument.data());
+    return guarded_run(argc, utf8.data());
+}
+#else
+int main(int argc, char **argv) { return guarded_run(argc, argv); }
+#endif
