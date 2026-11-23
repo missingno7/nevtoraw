@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import array
+import importlib.util
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else "nevtoraw.exe").resolve()
 root = Path("out/cli-tests")
@@ -33,10 +34,36 @@ def tags(path):
 
 version = run("--version").strip()
 assert version == "nevtoraw 0.2.0", version
+catalog = run("cameras")
+assert "98 Nikon RGB calibrations" in catalog and "Nikon Z 7 2" in catalog and "Nikon D750" in catalog
+run("cameras", "unexpected", code=2)
+
+spec = importlib.util.spec_from_file_location("nikon_import", "tools/import_nikon_calibrations.py")
+nikon_import = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nikon_import)
+profile = nikon_import.read_profile(Path("out/raw-input-tests/calibration.dcp"))
+assert profile["model"] == "Nikon Fixture RGB" and profile["cm1"] == [1,0,0,0,1,0,0,0,1]
+assert profile["cm2"] == [2,0,0,0,2,0,0,0,2]
+assert nikon_import.camera_key("NIKON Z 7_2") == nikon_import.camera_key("Nikon Z 7 2")
+assert nikon_import.camera_key("E5400") == nikon_import.camera_key("Nikon Coolpix 5400")
 for command in ([], ["stack"], ["sr"], ["dng"], ["info"]):
     assert "--count" in run(*command, "--help")
 
 source = Path("out/raw-input-tests/plain.dng")
+nrw = Path("out/raw-input-tests/native-burst/a.NRW")
+run("info", nrw)
+run("dng", nrw, "-o", root / "nrw-convert")
+run("stack", nrw, "--no-align", "-o", root / "nrw-stack")
+run("sr", nrw, "--count", "1", "--crop", "3,5,12,10", "-o", root / "nrw-sr")
+for command in ("dng", "stack", "sr"):
+    destination = root / ("d1x-" + command)
+    arguments = ("--no-align",) if command == "stack" else ()
+    run(command, Path("out/raw-input-tests/d1x.nef"), *arguments, "-o", destination)
+    output = next(destination.glob("*.dng"))
+    kind, count, pointer = tags(output)[50718]
+    assert (kind, count) == (5, 2)
+    values = struct.unpack_from("<4I", output.read_bytes(), struct.unpack("<I", pointer)[0])
+    assert values[0] / values[1] == .75 and values[2] / values[3] == 1.5
 unicode_source = root / "\u017elu\u0165ou\u010dk\u00fd sn\u00edmek.dng"
 shutil.copyfile(source, unicode_source)
 run("info", unicode_source)

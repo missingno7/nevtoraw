@@ -24,6 +24,7 @@ struct MovieInfo {
     unsigned crop_x = 0, crop_y = 0;
     bool explicit_crop = false;
     unsigned active_x = 0, active_y = 0, active_w = 0, active_h = 0;
+    double default_scale_x = 1, default_scale_y = 1; // sensor pixel aspect (D1X)
     std::vector<ProfileTag> profile;
     std::string body_serial, lens_make, lens_model, lens_serial;
     uint32_t lens_spec[8] = {};  // 4 rationals (min/max focal, min/max f-number)

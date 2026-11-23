@@ -11,26 +11,40 @@ NEV supports the tested N-RAW container and HE/TicoRAW frame variants. Z 8 8.3K,
 scale. Other NEV bodies can supply their frame matrix when no bundled calibration
 exists; that fallback has less validation.
 
-NEF supports RGB Bayer 12/14-bit lossless/lossy compression, HE/HE★, and supported
+NEF/NRW supports RGB Bayer 12/14-bit lossless/lossy compression, HE/HE★, and supported
 packed/unpacked 12/14/16-bit layouts. Raw strips must be contiguous. Small-size RGB
 NEFs and CMYG sensors lack the required Bayer mosaic. Nikon black-level tags are
-converted from their 14-bit convention for 12-bit files.
+converted from their 14-bit convention for 12-bit files. Coolpix NRW also accepts
+UNDEFINED CFA bytes and reads its separate black-level blocks. White balance
+handles the older D100/D2H/D70 ColorBalance records, E-series blocks, and NRW
+records in addition to the usual Nikon WB tag. The two green multipliers are
+averaged when normalizing white balance. Encrypted ColorBalance-only variants
+are not decoded; a missing supported WB record leaves AsShotNeutral unspecified.
+D1X output carries its non-square sensor aspect in DNG DefaultScale; alignment
+and crop coordinates remain in the original sensor grid.
 
-Z 6, Z 7, and Z 8 have native calibrations. The 40-model table also includes Z 6II,
-Z 9, Z f, Z 50, Z 6III, Z 5II, Z 50II, ZR, and older DSLR/Nikon 1/Coolpix bodies
-represented in local samples. Exact identifiers are in
-[`camera_profiles.inc`](../src/camera_profiles.inc) and the Z 8 entry in
-[`dng.cpp`](../src/dng.cpp). These are Adobe-converted sample dual-illuminant matrices,
-not guessed substitutions for other models.
+The bundled [catalog lists 98 RGB Nikon calibrations](nikon-cameras.md), also shown
+by `nevtoraw cameras`. Model matching accommodates Nikon punctuation/case variants
+(for example Z 7_2 and Z 7 2) and E5400/E8400/E8800 identifiers. Existing 40
+sample-derived dual-illuminant calibrations are retained. Another 58 come from
+numerical Adobe Standard DCP metadata; their filenames, hashes, and extracted
+fields are recorded in [`camera_profiles_extra.json`](../src/camera_profiles_extra.json).
+No rendering LUTs or Adobe runtime software are bundled. Additional entries have
+no measured BaselineExposure override, so the DNG default of zero applies.
 
 An unlisted camera can be inspected/decoded if its format is supported, but writing
 a color DNG needs calibration. Add a verified entry or convert its originals to
-calibrated Bayer DNG first. Native NEF WhiteLevel defaults to the decoded bit-depth
+calibrated Bayer DNG first. Native NEF/NRW WhiteLevel defaults to the decoded bit-depth
 maximum; use `--white` when a lower saturation level is known. DNG uses its embedded
 WhiteLevel.
 
-Local checks decoded 77 of 79 Nikon samples. The rejected samples were RGB small-size
-and CMYG. Z 6 uncompressed/lossless and Z 7 lossless matched Adobe raw values
+Local checks decoded and exported calibrated crops from **87 of 89 NEF/NRW samples**,
+with white balance present in all 87. The rejected samples were RGB small-size
+and CMYG. Newly checked crops from nine NRW models and five older NEFs matched
+fresh Adobe-converted sample values after accounting for border removal and the
+P7700's 16-to-14-bit representation. This comparison covers raw sample values;
+default crop, saturation level, and rendering can differ from Adobe.
+Z 6 uncompressed/lossless and Z 7 lossless matched Adobe raw values
 bit-for-bit. Nikon-curve decoding of the tested Z 6 lossy sample differed from
 Adobe's linearization by at most 3 raw levels. White balance and crop matched.
 Z 6/Z 8 bursts were also tested through stacking/SR. This is sample-based validation,

@@ -316,6 +316,125 @@ static void small_jpeg_strips(const fs::path &dir) {
     }
 }
 
+static void nikon_catalog(const fs::path &dir) {
+    require(nev::calibrated_cameras().size()==98,"Nikon RGB catalog incomplete");
+    nev::MovieInfo movie;nev::FrameInfo info;
+    for(const char *model:{"NIKON D750","NIKON D610","NIKON D800E","NIKON D810A","NIKON Df",
+            "NIKON D5500","NIKON 1 AW1","NIKON Z 7_2","NIKON Z 5","NIKON Z 30","NIKON Z fc",
+            "NIKON Z5_2C","COOLPIX P1100","COOLPIX P950","COOLPIX P6000","E5400","E8400","E8800"}) {
+        movie.model=model;require(nev::has_color_profile(movie,info),"missing Nikon model or metadata alias");
+    }
+    for(const char *model:{"NIKON Unknown Camera","E5700","COOLPIX 5000","CANON D750"}) {
+        movie.model=model;require(!nev::has_color_profile(movie,info),"unverified/non-RGB calibration substituted");
+    }
+    movie.model="NIKON Z 7_2";nev::DngOptions options;options.compression=nev::DngCompression::None;
+    auto data=nev::build_dng(std::vector<uint16_t>(16,2000),4,4,movie,info,0,"source",options);
+    auto t=tiffr::open(data);auto d=t.directory(t.number(4));
+    require(t.string(d,0xc614)=="Nikon Z 7 2"&&d.at(0xc621).count==9,"wrong imported profile selected");
+    require(!d.count(0xc62a),"unmeasured camera exposure baseline invented");
+    movie.model="NIKON Z 8";
+    data=nev::build_dng(std::vector<uint16_t>(16,2000),4,4,movie,info,0,"source",options);
+    auto old=tiffr::open(data);d=old.directory(old.number(4));
+    require(std::abs(old.real(d,0xc62a)-.20)<.0001,"sample-verified baseline changed");
+
+    tiffw::Ifd profile;
+    profile.add_ascii(0xc614,"Nikon Fixture RGB");
+    profile.add_srational(0xc621,std::vector<double>{1,0,0,0,1,0,0,0,1});
+    profile.add_srational(0xc622,std::vector<double>{2,0,0,0,2,0,0,0,2});
+    profile.add_short(0xc65a,{17});profile.add_short(0xc65b,{21});
+    auto fixture=tiffw::build(profile,{});fixture[2]=0x52;fixture[3]=0x43;
+    write(dir/"calibration.dcp",fixture);
+}
+
+static void native_nikon_fixture(const fs::path &dir) {
+    const unsigned w=32,h=24;
+    std::vector<uint16_t> expected(w*h);
+    std::vector<uint8_t> packed;
+    for(unsigned i=0;i<w*h;++i)expected[i]=uint16_t(700+i);
+    for(unsigned i=0;i<w*h;i+=2) {
+        packed.push_back(uint8_t(expected[i]>>4));
+        packed.push_back(uint8_t((expected[i]&15)<<4|expected[i+1]>>8));
+        packed.push_back(uint8_t(expected[i+1]));
+    }
+    // Coolpix NRW packs the MSB-first stream into little-endian 32-bit words.
+    for(size_t i=0;i<packed.size();i+=4) {std::swap(packed[i],packed[i+3]);std::swap(packed[i+1],packed[i+2]);}
+    auto fixture=[&](tiffw::Ifd maker,const std::string &model="COOLPIX P950") {
+        auto note=tiffw::build(maker,{});
+        note.insert(note.begin(),{'N','i','k','o','n',0,2,0,0,0});
+        auto exif=std::make_shared<tiffw::Ifd>();exif->add_bytes(0x927c,tiffw::UNDEFINED,note);
+        auto raw=std::make_shared<tiffw::Ifd>();
+        raw->add_long(256,{w});raw->add_long(257,{h});raw->add_short(258,{12});
+        raw->add_short(259,{1});raw->add_short(262,{32803});
+        raw->add_short(33421,{2,2});raw->add_bytes(33422,tiffw::UNDEFINED,{0,1,1,2});
+        std::vector<std::vector<uint8_t>> blobs{packed};
+        if(model.rfind("COOLPIX",0)!=0) for(size_t i=0;i<blobs[0].size();i+=4) {
+            std::swap(blobs[0][i],blobs[0][i+3]);std::swap(blobs[0][i+1],blobs[0][i+2]);
+        }
+        raw->add_offsets(273,279,{0},blobs);
+        tiffw::Ifd root;root.add_ascii(271,"NIKON CORPORATION");root.add_ascii(272,model);
+        root.add_sub(330,{raw});root.add_sub(34665,{exif});
+        return tiffw::build(root,blobs);
+    };
+    tiffw::Ifd maker;maker.add_short(0x3d,{1008,1008,1008,1008});
+    maker.add_rational(0xc,std::vector<double>{2,1.5,1,1});
+    auto bytes=fixture(maker);auto folder=dir/"native-burst";fs::create_directories(folder);
+    write(folder/"a.NRW",bytes);write(folder/"b.nef",bytes);
+    for(const char *name:{"a.NRW","b.nef"}) {
+        auto p=read(folder/name);
+        require(p.pixels==expected&&p.black==252&&p.white==4095,"native Nikon dispatch/12-bit decode wrong");
+        require(p.info.has_wb&&p.info.wb_r==2&&p.info.wb_b==1.5,"native Nikon white balance lost");
+        require(nev::has_color_profile(p.movie,p.info),"NRW camera lacks calibration");
+    }
+    nev::InputSource source;std::string err;
+    require(source.open(folder,err)&&source.size()==2,"native Nikon folder dispatch failed");
+
+    auto check=[&](tiffw::Ifd note,unsigned black) {
+        auto path=dir/"metadata.nrw";write(path,fixture(note));auto p=read(path);
+        require(p.pixels==expected&&p.black==black,"Coolpix metadata changed raw samples or black level");
+        require(p.info.has_wb&&std::abs(p.info.wb_r-2)<.00001&&std::abs(p.info.wb_b-1.5)<.00001,
+                "Nikon white balance metadata layout wrong");
+        return p;
+    };
+    tiffw::Ifd greens;greens.add_rational(0xc,std::vector<double>{3,2.25,1,2});check(greens,0);
+    for(const char *version:{"0100","0102","0103","0500","0502"}) {
+        std::vector<uint8_t> block(80);std::copy_n(version,4,block.begin());
+        auto word=[&](unsigned offset,unsigned value) {block[offset]=uint8_t(value);block[offset+1]=uint8_t(value>>8);};
+        if(std::string(version)=="0100") {word(72,1024);word(74,768);word(76,256);word(78,768);}
+        if(std::string(version)=="0102") {word(10,1024);word(12,256);word(14,768);word(16,768);}
+        if(std::string(version)=="0103") {word(20,1024);word(22,256);word(24,768);word(26,768);}
+        tiffw::Ifd note;
+        unsigned black=0;
+        if(version[0]=='0'&&version[1]=='5') {
+            unsigned offset=version[3]=='2'?56:54;
+            word(offset,3201);word(offset+2,3217);word(offset+4,3233);black=200;
+            note.add_rational(0xc,std::vector<double>{2,1.5,1,1});
+        }
+        note.add_bytes(0x97,tiffw::UNDEFINED,block);auto p=check(note,black);
+        if(black) require(p.info.black_delta[0]==0&&p.info.black_delta[1]==1&&p.info.black_delta[3]==2,
+                          "Coolpix color black codes lost their CFA phase");
+    }
+    for(bool old:{false,true}) {
+        std::vector<uint8_t> block(old?0x1400:72);
+        std::copy_n(old?"NRW 0100":"NRW 0104",8,block.begin());
+        unsigned offset=old?0x13e8:56;
+        for(unsigned value:{1024u,256u,1792u,768u}) {
+            for(unsigned b=0;b<4;++b) block[offset++]=uint8_t(value>>(8*b));
+        }
+        block[32]=200;
+        tiffw::Ifd note;note.add_bytes(0x14,tiffw::UNDEFINED,block);check(note,old?0:200);
+    }
+    std::vector<uint8_t> old_coolpix(2560);old_coolpix[0x4e0]=2;old_coolpix[0x4e2]=1;old_coolpix[0x4e3]=128;
+    tiffw::Ifd note;note.add_bytes(0x14,tiffw::UNDEFINED,old_coolpix);check(note,0);
+
+    write(dir/"d1x.nef",fixture(maker,"NIKON D1X"));auto d1x=read(dir/"d1x.nef");
+    require(d1x.pixels==expected&&d1x.movie.default_scale_x==.75&&d1x.movie.default_scale_y==1.5,
+            "D1X sensor aspect lost");
+    nev::DngOptions options;options.compression=nev::DngCompression::None;
+    auto output=nev::build_dng(d1x.pixels,w,h,d1x.movie,d1x.info,0,"source",options);
+    auto t=tiffr::open(output);auto d=t.directory(t.number(4));
+    require(t.real(d,0xc61e,1,0)==.75&&t.real(d,0xc61e,1,1)==1.5,"D1X DNG aspect wrong");
+}
+
 static void jpeg_predictors() {
     // Independently specified 2x2 fixtures. Reduced-precision samples are
     // initial+[2,3,0,7]; these are the known final differences for predictors 1..7.
@@ -372,6 +491,7 @@ int main() {
         for(unsigned bits:{8,12,14,16}) for(bool little:{false,true}) packed(dir,bits,little);
         sr_black();
         stack_levels();input_source(dir);selection();atomic_output(dir);high_black(dir);jpeg_predictors();shared_crop(dir);small_jpeg_strips(dir);
+        nikon_catalog(dir);native_nikon_fixture(dir);
         std::cout<<"Raw input tests passed\n";return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

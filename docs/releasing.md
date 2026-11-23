@@ -31,6 +31,9 @@ Coverage includes TIFF packing/byte order, lossless JPEG roundtrips and truncate
 files, calibration/white balance/crop preservation, black offsets, full sample
 range, frame selection, all-frame stacking defaults, scales 1–4, output types,
 folder conversion/inspection, Unicode paths, invalid options, and source protection.
+Nikon fixtures cover native NEF/NRW folder input, old/NRW white-balance blocks,
+Coolpix black-level scales, model aliases/calibration selection, the DCP importer,
+and D1X sensor aspect. Tests use synthetic metadata, not bundled camera originals.
 
 Where local camera files are available, additionally exercise:
 
@@ -47,6 +50,9 @@ decoded output sample arrays with prior accepted outputs or an independent raw
 decoder, and inspect crops/color in a raw converter. File hashes can change solely
 because the version or description metadata changed. Raw samples must be compared
 separately. Check representative outputs from both compression modes.
+For broader Nikon changes, include DSLR/Nikon 1/Coolpix NEFs and NRW files. A
+catalog entry verifies calibration availability; it does not substitute for a
+capture-mode test. The current local corpus results are in [raw formats](raw-formats.md).
 
 ## Build artifacts
 

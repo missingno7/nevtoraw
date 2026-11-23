@@ -4,6 +4,7 @@
 
 namespace nev {
 
+// Nikon TIFF raw containers (.NEF and .NRW).
 bool read_nef(const std::string &path, RawPhoto &photo, std::string &err);
 
 } // namespace nev

@@ -24,10 +24,11 @@ namespace fs = std::filesystem;
 
 static void usage(FILE *stream = stderr) {
     fprintf(stream,
-            "nevtoraw [dng] <raw-folder|NEV|NEF|DNG> export Bayer frames (default command)\n"
-            "nevtoraw stack <raw-folder|NEV|NEF|DNG> align and merge a Bayer DNG\n"
-            "nevtoraw sr <raw-folder|NEV|NEF|DNG> reconstruct a LinearRaw DNG\n"
-            "nevtoraw info <raw-folder|NEV|NEF|DNG> show source details and folder indices\n"
+            "nevtoraw [dng] <raw-folder|NEV|NEF|NRW|DNG> export Bayer frames (default command)\n"
+            "nevtoraw stack <raw-folder|NEV|NEF|NRW|DNG> align and merge a Bayer DNG\n"
+            "nevtoraw sr <raw-folder|NEV|NEF|NRW|DNG> reconstruct a LinearRaw DNG\n"
+            "nevtoraw info <raw-folder|NEV|NEF|NRW|DNG> show source details and folder indices\n"
+            "nevtoraw cameras                    list bundled Nikon RGB calibrations\n"
             "  -h, --help         show this help; accepted after a command too\n"
             "      --version      show program version\n"
             "  -f, --frames LIST   frames: 0 | 0-10 | 0,12,50 | 0-143:6 | all\n"
@@ -255,6 +256,13 @@ static int run(int argc, char **argv) {
     for (int i = 1; i < argc; ++i)
         if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") { usage(stdout); return 0; }
     if (cmd == "--version") { printf("nevtoraw %s\n", std::string(nev::version).c_str()); return 0; }
+    if (cmd == "cameras") {
+        if (argc != 2) { usage(); return 2; }
+        const auto models = nev::calibrated_cameras();
+        printf("%zu Nikon RGB calibrations; supported Bayer capture modes required\n",models.size());
+        for (const auto &model : models) printf("%s\n",model.c_str());
+        return 0;
+    }
     if (cmd == "info") {
         if (argc != 3) { usage(); return 2; }
         return cmd_info(argv[2]);

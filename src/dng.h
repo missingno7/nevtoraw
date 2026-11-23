@@ -20,6 +20,7 @@ struct DngOptions {
 };
 
 bool has_color_profile(const MovieInfo &movie, const FrameInfo &frame);
+std::vector<std::string> calibrated_cameras();
 
 // Build a DNG from a Bayer mosaic or interleaved camera-native RGB samples.
 std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned width, unsigned height, const MovieInfo &mi,

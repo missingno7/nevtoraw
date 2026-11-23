@@ -2,10 +2,12 @@
 
 ## 0.2.0
 
-- Shared NEV, NEF, and Bayer DNG input for conversion, stacking, SR, and folder inspection.
+- Shared NEV, NEF, NRW, and Bayer DNG input for conversion, stacking, SR, and folder inspection.
 - Shared `--crop` for conversion, stacking, and SR, preserving Bayer/black-level phase.
 - Lossless JPEG strips for small crops, avoiding padded-row decoding errors in raw converters.
 - Z 6/Z 7 support and broader Nikon decoders/calibrations reused from nefcomp.
+- 98 Nikon RGB calibrations, normalized model aliases, and a `cameras` catalog command.
+- Older Nikon/Coolpix white balance, NRW CFA and black-level metadata, and D1X sensor aspect.
 - Homography by default; all frames by default for stacking.
 - Robust mean, median, and trimmed-mean Bayer stacking with per-CFA black correction.
 - 1x–4x raw SR; 2x LinearRaw and sigma 0.30 by default.

@@ -5,14 +5,20 @@ nevtoraw [dng] INPUT [OPTIONS]
 nevtoraw stack INPUT [OPTIONS]
 nevtoraw sr INPUT [OPTIONS]
 nevtoraw info INPUT
+nevtoraw cameras
 nevtoraw --version
 ```
 
-`INPUT` is a NEV, NEF, Bayer DNG, or still-image folder. `dng` is the default
-command. Keep one camera/burst and one source format in a folder. Mixed NEF/DNG
-folders are rejected. Indexing is lexicographic filename order, without recursion.
+`INPUT` is a NEV, NEF, NRW, Bayer DNG, or still-image folder. `dng` is the default
+command. Keep one camera/burst and one source format in a folder. NEF and NRW are
+both native Nikon input; mixing either with DNG is rejected. Indexing is
+lexicographic filename order, without recursion.
 Use `info INPUT` to inspect a folder's mapping. Folder metadata describes its
 first file; compatibility of selected frames is checked during processing.
+
+`cameras` lists the bundled Nikon RGB calibrations without opening an input.
+It accepts no input or processing options. See the [camera catalog](nikon-cameras.md)
+and [capture-format limits](raw-formats.md).
 
 ## Shared options
 

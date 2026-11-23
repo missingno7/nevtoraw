@@ -8,7 +8,7 @@ namespace fs = std::filesystem;
 bool raw_photo_path(const fs::path &path) {
     auto ext = path.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    return ext == ".nef" || ext == ".dng";
+    return ext == ".nef" || ext == ".nrw" || ext == ".dng";
 }
 bool InputSource::open(const fs::path &input, std::string &err) {
     photos_.clear();
@@ -20,14 +20,14 @@ bool InputSource::open(const fs::path &input, std::string &err) {
                 if (entry.is_regular_file() && raw_photo_path(entry.path())) photos_.push_back(entry.path());
         } else photos_.push_back(input);
         std::sort(photos_.begin(), photos_.end());
-        if (photos_.empty()) { err = input.u8string() + ": no NEF or Bayer DNG files"; return false; }
+        if (photos_.empty()) { err = input.u8string() + ": no NEF, NRW or Bayer DNG files"; return false; }
         auto nef = [](const fs::path &p) {
             auto ext = p.extension().u8string();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-            return ext == ".nef";
+            return ext == ".nef" || ext == ".nrw";
         };
         if (std::any_of(photos_.begin(), photos_.end(), [&](const auto &p) { return nef(p) != nef(photos_.front()); })) {
-            err = input.u8string() + ": keep NEF and DNG bursts in separate directories";
+            err = input.u8string() + ": keep native Nikon and DNG bursts in separate directories";
             return false;
         }
         return true;

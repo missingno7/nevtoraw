@@ -20,8 +20,8 @@ Version **0.2.0**, Windows x64, one standalone executable.
 .\nevtoraw.exe dng examples\DSC_8038.NEV --frames 10-25 -o out\frames
 ```
 
-`dng`, `stack`, and `sr` share one input loader. They accept a NEV clip, a NEF
-or Bayer DNG still, or a folder containing one NEF or DNG burst. Folder files are
+`dng`, `stack`, and `sr` share one input loader. They accept a NEV clip, a NEF,
+NRW or Bayer DNG still, or a folder containing one Nikon raw or DNG burst. Folder files are
 sorted by filename, indexed from zero, without recursing into subfolders.
 `info` shows the index-to-filename mapping before processing.
 
@@ -83,8 +83,11 @@ and white balance for subsequent processing.
 
 ## Inputs and outputs
 
-Native NEF decoding comes from [nefcomp](https://github.com/missingno7/nefcomp).
-Z 6, Z 7, and Z 8 are supported, with calibrations for 40 Nikon models in total.
+Native NEF/NRW decoding comes from [nefcomp](https://github.com/missingno7/nefcomp).
+The bundled [98-model Nikon catalog](docs/nikon-cameras.md) covers RGB Bayer models
+across Z, DSLR, Nikon 1, and raw-capable Coolpix families. Run
+`.\nevtoraw.exe cameras` to list calibrations. CMYG sensors and RGB small-raw modes
+are excluded; calibration coverage does not guarantee every capture mode.
 Other cameras can use calibrated Bayer DNG input. See the exact
 [camera and DNG limits](docs/raw-formats.md); DNG support is a defined subset,
 including uncompressed and lossless JPEG integer Bayer files.

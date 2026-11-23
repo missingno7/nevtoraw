@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -20,16 +21,34 @@ namespace {
 
 struct KnownCamera {
     const char *model, *unique;
-    double cm1[9], cm2[9];  // StdA, D65 (Adobe DNG Converter 17.2)
+    double cm1[9], cm2[9];  // dual-illuminant camera calibration (see receipts)
     unsigned illum1, illum2;
     double baseline_exposure;
+    bool has_baseline = true;
 };
 const KnownCamera kCameras[] = {
     {"NIKON Z 8", "Nikon Z 8",
      {1.3998, -0.8092, 0.0284, -0.4723, 1.2772, 0.2159, -0.0164, 0.0624, 0.8674},
      {1.1423, -0.4564, -0.1123, -0.4816, 1.2895, 0.2119, -0.0210, 0.1061, 0.7282}, 17, 21, 0.20},
 #include "camera_profiles.inc"
+#include "camera_profiles_extra.inc"
 };
+
+std::string camera_key(const std::string &model) {
+    std::string key;
+    for (unsigned char c : model) if (c < 128 && std::isalnum(c)) key += char(std::toupper(c));
+    if (key.rfind("NIKON",0) == 0) key.erase(0,5);
+    if (key.size() == 5 && key[0] == 'E' && std::all_of(key.begin()+1,key.end(),[](char c) { return c >= '0' && c <= '9'; }))
+        key = "COOLPIX" + key.substr(1);
+    return key;
+}
+
+const KnownCamera *known_camera(const std::string &model) {
+    const auto key = camera_key(model);
+    for (const auto &camera : kCameras)
+        if (key == camera_key(camera.model)) return &camera;
+    return nullptr;
+}
 
 void inv3(const double m[9], double o[9]) {
     double a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5], g = m[6], h = m[7], i = m[8];
@@ -72,8 +91,14 @@ std::string add_seconds(const std::string &dt, long add) {
 
 bool has_color_profile(const MovieInfo &mi, const FrameInfo &fi) {
     if (!mi.profile.empty() || fi.has_matrix) return true;
-    for (const auto &c : kCameras) if (mi.model == c.model) return true;
-    return false;
+    return known_camera(mi.model) != nullptr;
+}
+
+std::vector<std::string> calibrated_cameras() {
+    std::vector<std::string> models;
+    for (const auto &camera : kCameras) models.push_back(camera.unique);
+    std::sort(models.begin(),models.end(),[](const auto &a,const auto &b) { return camera_key(a)<camera_key(b); });
+    return models;
 }
 
 std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsigned H, const MovieInfo &mi,
@@ -179,6 +204,8 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         raw.add_rational(0xc61a, black);
     } else raw.add_long(0xc61a, std::vector<uint32_t>(channels, opt.black_level));
     raw.add_long(0xc61d, std::vector<uint32_t>(channels, opt.white_level));
+    if (mi.default_scale_x != 1 || mi.default_scale_y != 1)
+        raw.add_rational(0xc61e,std::vector<double>{mi.default_scale_x,mi.default_scale_y});
     unsigned cw = mi.crop_w && mi.crop_w <= W ? mi.crop_w : W, ch = mi.crop_h && mi.crop_h <= H ? mi.crop_h : H;
     unsigned ox = ((W - cw) / 2) & ~1u, oy = ((H - ch) / 2) & ~1u;
     if (mi.explicit_crop) { ox = mi.crop_x; oy = mi.crop_y; }
@@ -206,8 +233,7 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
     ifd0.add_bytes(0xc612, BYTE, {1, 6, 0, 0});
     ifd0.add_bytes(0xc613, BYTE, {1, 4, 0, 0});
 
-    const KnownCamera *kc = nullptr;
-    for (auto &c : kCameras) if (mi.model == c.model) kc = &c;
+    const KnownCamera *kc = known_camera(mi.model);
     if (!mi.profile.empty()) {
         for (const auto &tag : mi.profile) {
             Entry e;
@@ -220,7 +246,7 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         ifd0.add_srational(0xc622, std::vector<double>(kc->cm2, kc->cm2 + 9));
         ifd0.add_short(0xc65a, {uint16_t(kc->illum1)});
         ifd0.add_short(0xc65b, {uint16_t(kc->illum2)});
-        ifd0.add_srational(0xc62a, std::vector<double>{kc->baseline_exposure}, 100);
+        if (kc->has_baseline) ifd0.add_srational(0xc62a, std::vector<double>{kc->baseline_exposure}, 100);
     } else {
         if (!fi.has_matrix) throw std::runtime_error("no color calibration for " + mi.model + "; convert the NEF to Bayer DNG first");
         // Fallback: the camera's own (white-balanced RGB -> XYZ D65) matrix for this frame,

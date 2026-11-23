@@ -11,7 +11,13 @@ The application is GPL-2.0-or-later; see [COPYING](COPYING).
 - Nikon Huffman decoding and packing routines: adapted from nefcomp,
   GPL-2.0-or-later, with local input validation.
 - Camera matrices: numerical calibration metadata extracted from Adobe-converted
-  local Nikon samples. Adobe software is not bundled.
+  local Nikon samples and installed Adobe Standard DCPs. Additional matrix fields,
+  source filenames, and hashes are in `src/camera_profiles_extra.json`; the importer
+  exports only camera identity, color matrices, and illuminants. DCP files, rendering
+  LUTs, and Adobe software are not bundled.
+- Nikon metadata layout facts were cross-checked against
+  [LibRaw's Nikon metadata reader](https://github.com/LibRaw/LibRaw/blob/master/src/metadata/nikon.cpp)
+  and [ExifTool's Nikon tag definitions](https://github.com/exiftool/exiftool/blob/master/lib/Image/ExifTool/Nikon.pm).
 
 This product includes DNG technology under license by Adobe. Nikon, Adobe, and
 intoPIX are trademarks of their respective owners. This is an independent

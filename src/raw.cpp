@@ -208,9 +208,9 @@ RawPhoto decode_dng(const std::vector<uint8_t> &bytes) {
 bool read_raw_photo(const std::string &path, RawPhoto &photo, std::string &err) {
     auto ext = std::filesystem::u8path(path).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    if (ext == ".nef") return read_nef(path, photo, err);
+    if (ext == ".nef" || ext == ".nrw") return read_nef(path, photo, err);
     try {
-        if (ext != ".dng") throw std::runtime_error("expected a NEF or Bayer DNG");
+        if (ext != ".dng") throw std::runtime_error("expected a NEF, NRW or Bayer DNG");
         std::ifstream f(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
         auto length = f.tellg();
         if (length < 8 || uint64_t(length) > UINT32_MAX) throw std::runtime_error("cannot open or size classic DNG");
@@ -235,6 +235,7 @@ bool valid_photo(const RawPhoto &p) {
 bool compatible_photos(const RawPhoto &a, const RawPhoto &b) {
     if (!valid_photo(b) || a.width != b.width || a.height != b.height ||
         a.movie.model != b.movie.model || a.movie.make != b.movie.make ||
+        a.movie.default_scale_x != b.movie.default_scale_x || a.movie.default_scale_y != b.movie.default_scale_y ||
         a.movie.profile.empty() != b.movie.profile.empty() || !std::equal(a.info.cfa,a.info.cfa+4,b.info.cfa)) return false;
     for (unsigned tag : {0xc614u,0xc621u,0xc622u,0xc623u,0xc624u,0xc627u}) {
         auto find = [tag](const MovieInfo &m) -> const ProfileTag * {

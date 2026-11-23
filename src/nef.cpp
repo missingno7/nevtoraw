@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -63,7 +64,7 @@ RawPhoto decode_nef(const std::vector<uint8_t> &bytes) {
     const auto *strip = t.at(start, length);
     RawPhoto p;
     const auto cfa = raw.find(0x828e);
-    if (cfa == raw.end() || cfa->second.type != 1 || cfa->second.count != 4 ||
+    if (cfa == raw.end() || (cfa->second.type != 1 && cfa->second.type != 7) || cfa->second.count != 4 ||
         t.scalar(raw, 0x828d) != 2 || t.scalar(raw, 0x828d, 0, 1) != 2)
         throw std::runtime_error("unsupported CFA layout");
     const auto *pattern = t.at(cfa->second.pos, 4);
@@ -102,9 +103,29 @@ RawPhoto decode_nef(const std::vector<uint8_t> &bytes) {
         p.black /= 4;
         for (float &d : p.info.black_delta) d = baseline + d * .25f - p.black;
     }
+    // NRW stores its black code directly on the decoded scale, outside tag 0x003d.
+    if (!maker.count(0x003d)) {
+        if (auto tag = maker.find(0x0014); tag != maker.end() && tag->second.bytes >= 34 &&
+            std::memcmp(m.at(tag->second.pos,8),"NRW 01",6) == 0 &&
+            std::memcmp(m.at(tag->second.pos+4,4),"0100",4) != 0) {
+            p.black = m.number(tag->second.pos+32,2);
+        }
+        // P330/P340/P7700/P7800 store three color black codes in 16-bit words.
+        if (auto tag = maker.find(0x0097); tag != maker.end() && tag->second.bytes >= 60 &&
+            (std::memcmp(m.at(tag->second.pos,4),"0500",4) == 0 ||
+             std::memcmp(m.at(tag->second.pos,4),"0502",4) == 0)) {
+            std::array<double,3> levels;
+            const size_t offset = std::memcmp(m.at(tag->second.pos,4),"0502",4) == 0 ? 56 : 54;
+            if (offset+6 > tag->second.bytes) throw std::runtime_error("truncated Coolpix black-level block");
+            for (unsigned c=0;c<3;++c) levels[c] = m.number(tag->second.pos+offset+c*2,2) >> (16-bits);
+            p.black = unsigned(std::floor(levels[0]));
+            for (unsigned site=0;site<4;++site) p.info.black_delta[site] = float(levels[p.info.cfa[site]]-p.black);
+        }
+    }
     if (p.black >= p.white) throw std::runtime_error("invalid raw levels");
     p.movie.make = t.string(root, 0x010f);
     p.movie.model = model;
+    if (model == "NIKON D1X") { p.movie.default_scale_x = .75; p.movie.default_scale_y = 1.5; }
     p.movie.software = t.string(root, 0x0131);
     p.movie.date_original = t.string(exif, 0x9003);
     p.movie.date_create = t.string(root, 0x0132);
@@ -125,7 +146,39 @@ RawPhoto decode_nef(const std::vector<uint8_t> &bytes) {
     p.info.orientation = std::clamp(t.scalar(root, 0x0112, 1), 1u, 8u);
     p.info.wb_r = m.ratio(maker, 0x000c);
     p.info.wb_b = m.ratio(maker, 0x000c, 1);
+    const double g1=m.ratio(maker,0x000c,2), g2=m.ratio(maker,0x000c,3);
+    if (g1 > 0 && g2 > 0) {
+        p.info.wb_r = float(p.info.wb_r/((g1+g2)*.5));
+        p.info.wb_b = float(p.info.wb_b/((g1+g2)*.5));
+    }
     p.info.has_wb = p.info.wb_r > 0 && p.info.wb_b > 0;
+    if (!p.info.has_wb) {
+        auto wb = [&](double red, double green, double blue) {
+            if (red <= 0 || green <= 0 || blue <= 0) return;
+            p.info.wb_r = float(red/green); p.info.wb_b = float(blue/green); p.info.has_wb = true;
+        };
+        if (auto tag = maker.find(0x0014); tag != maker.end()) {
+            const size_t pos = tag->second.pos, n = tag->second.bytes;
+            if (n == 2560) {
+                Tiff be{bytes,false};
+                wb(be.number(pos+0x4e0,2),256,be.number(pos+0x4e2,2));
+            } else if (n >= 72 && std::memcmp(m.at(pos,8),"NRW ",4) == 0) {
+                size_t offset = std::memcmp(m.at(pos+4,4),"0100",4) == 0 ? 0x13e8 : 56;
+                if (offset+16 <= n) wb(2.0*m.number(pos+offset),
+                    (double(m.number(pos+offset+4))+m.number(pos+offset+8))*.5,2.0*m.number(pos+offset+12));
+            }
+        }
+        if (!p.info.has_wb) if (auto tag = maker.find(0x0097); tag != maker.end() && tag->second.bytes >= 4) {
+            size_t pos = tag->second.pos, n = tag->second.bytes;
+            const auto *version = m.at(pos,4);
+            if (n >= 80 && std::memcmp(version,"0100",4) == 0)
+                wb(m.number(pos+72,2),(m.number(pos+76,2)+m.number(pos+78,2))*.5,m.number(pos+74,2));
+            else if (n >= 18 && std::memcmp(version,"0102",4) == 0)
+                wb(m.number(pos+10,2),(m.number(pos+12,2)+m.number(pos+14,2))*.5,m.number(pos+16,2));
+            else if (n >= 28 && std::memcmp(version,"0103",4) == 0)
+                wb(m.number(pos+20,2),(m.number(pos+22,2)+m.number(pos+26,2))*.5,m.number(pos+24,2));
+        }
+    }
     return p;
 }
 
@@ -135,7 +188,7 @@ bool read_nef(const std::string &path, RawPhoto &photo, std::string &err) {
     try {
         std::ifstream f(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
         const auto length = f.tellg();
-        if (length < 8) throw std::runtime_error("cannot open or size NEF");
+        if (length < 8) throw std::runtime_error("cannot open or size Nikon raw file");
         std::vector<uint8_t> bytes(static_cast<size_t>(length));
         if (!f.seekg(0).read(reinterpret_cast<char *>(bytes.data()), length))
             throw std::runtime_error("short read");

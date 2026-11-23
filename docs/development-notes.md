@@ -183,7 +183,7 @@ For example, `--frames 10-50 --count 10` selects
 final selection. `--ref N` must belong to the candidate selection. If necessary,
 it replaces the nearest sampled entry while keeping the requested count.
 
-NEF and DNG directories are sorted by filename, with the same zero-based indexing.
+NEF/NRW and DNG directories are sorted by filename, with the same zero-based indexing.
 The console lists the exact selected indices and they are recorded in the DNG's
 ImageDescription. A read or alignment failure reports the affected frame and
 stops the SR run. Choose a different selection if a frame cannot align.
