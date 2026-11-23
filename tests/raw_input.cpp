@@ -292,6 +292,30 @@ static void shared_crop(const fs::path &dir) {
     }
 }
 
+static void small_jpeg_strips(const fs::path &dir) {
+    for(unsigned w:{95u,96u}) {
+        const unsigned h=270;
+        std::vector<uint16_t> pixels(w*h);
+        for(size_t i=0;i<pixels.size();++i)pixels[i]=uint16_t(i*1777u+13u);
+        nev::DngOptions options;options.white_level=65535;options.black_level=0;
+        auto bytes=nev::build_dng(pixels,w,h,camera(),nev::FrameInfo{},0,"source",options);
+        const auto t=tiffr::open(bytes);auto d=t.directory(t.number(4));
+        require(d.count(0x111)&&!d.count(0x144),"small image uses padded JPEG tiles");
+        require(t.scalar(d,0x116)==256,"unexpected JPEG strip height");
+        for(unsigned k=0;k<2;++k) {
+            unsigned rows=std::min(256u,h-k*256);std::vector<uint16_t> decoded;std::string err;
+            size_t size=t.scalar(d,0x117,0,k),offset=t.scalar(d,0x111,0,k);
+            require(lj92::decode_tile(t.at(offset,size),size,size_t(w)*rows,decoded,err),err.c_str());
+            require(decoded.size()==size_t(w)*rows&&std::equal(decoded.begin(),decoded.end(),pixels.begin()+size_t(k)*256*w),
+                    "small JPEG strip rows changed");
+        }
+        if(!(w&1)) {
+            write(dir/"small-strips.dng",bytes);
+            require(read(dir/"small-strips.dng").pixels==pixels,"multi-strip DNG decode changed samples");
+        }
+    }
+}
+
 static void jpeg_predictors() {
     // Independently specified 2x2 fixtures. Reduced-precision samples are
     // initial+[2,3,0,7]; these are the known final differences for predictors 1..7.
@@ -347,7 +371,7 @@ int main() {
         roundtrip(dir);
         for(unsigned bits:{8,12,14,16}) for(bool little:{false,true}) packed(dir,bits,little);
         sr_black();
-        stack_levels();input_source(dir);selection();atomic_output(dir);high_black(dir);jpeg_predictors();shared_crop(dir);
+        stack_levels();input_source(dir);selection();atomic_output(dir);high_black(dir);jpeg_predictors();shared_crop(dir);small_jpeg_strips(dir);
         std::cout<<"Raw input tests passed\n";return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

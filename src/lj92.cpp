@@ -124,7 +124,7 @@ std::vector<uint8_t> encode_tile(const uint16_t *px, unsigned w, unsigned h, siz
 } // namespace
 
 std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits) {
-    return encode_tile(px, w, h, stride, bits, 2);
+    return encode_tile(px, w, h, stride, bits, (w & 1) ? 1 : 2);
 }
 
 std::vector<uint8_t> encode_rgb_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits) {

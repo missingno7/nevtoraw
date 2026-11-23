@@ -70,7 +70,8 @@ it, but this input reader requires even dimensions for quad-based alignment.
 ## Output
 
 Outputs are 16-bit Bayer or three-channel camera-native LinearRaw DNG, using
-uncompressed strips or 256×256 lossless JPEG tiles. They carry reference calibration,
+uncompressed strips or 256×256 lossless JPEG tiles (JPEG strips for images narrower
+than 256 pixels, for raw-reader compatibility). They carry reference calibration,
 white balance, black/white levels, crop/orientation, source filename, and processing
 description. LinearRaw samples remain in camera space, without white balance,
 display color transformation, or tone curve applied.

@@ -9,7 +9,7 @@ namespace lj92 {
 
 // Encode a w x h tile of 16-bit samples (row stride in samples). The tile is written
 // as w/2 x h with two interleaved components, as Adobe does for CFA data, so the
-// left predictor sees the same colour. w must be even.
+// left predictor sees the same colour. Odd widths use one component instead.
 std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits);
 std::vector<uint8_t> encode_rgb_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits);
 

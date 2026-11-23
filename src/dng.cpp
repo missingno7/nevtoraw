@@ -111,6 +111,21 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         blobs.push_back(std::move(b));
         raw.add_long(0x0116, {H});
         raw.add_offsets(0x0111, 0x0117, {0}, blobs);
+    } else if (W < 256) {
+        // Keep JPEG rows at the actual image width. Padded tiles wider than a
+        // small image are misinterpreted as successive rows by some raw readers.
+        const unsigned rows = std::min(H,256u);
+        std::vector<int> ids;
+        for (unsigned y = 0; y < H; y += rows) {
+            const auto *samples = px.data() + size_t(y) * W * channels;
+            const unsigned height = std::min(rows,H-y);
+            ids.push_back(int(blobs.size()));
+            blobs.push_back(opt.linear_rgb ? lj92::encode_rgb_tile(samples,W,height,3*W,16)
+                                           : lj92::encode_cfa_tile(samples,W,height,W,16));
+        }
+        raw.add_short(0x0103, {7});
+        raw.add_long(0x0116, {rows});
+        raw.add_offsets(0x0111,0x0117,ids,blobs);
     } else {
         const unsigned T = 256;
         unsigned tx = (W + T - 1) / T, ty = (H + T - 1) / T;

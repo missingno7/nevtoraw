@@ -24,6 +24,9 @@ Python packages are required for tests. Python's standard library is sufficient.
 Test artifacts live under `out/`; do not commit them. `tests/cli.py` resets only
 its own `out/cli-tests` directory on each run.
 
+When `dcraw` is available, the CLI suite also compares small lossless-JPEG crop
+samples with that independent decoder. The core suite does not require it.
+
 Coverage includes TIFF packing/byte order, lossless JPEG roundtrips and truncated
 files, calibration/white balance/crop preservation, black offsets, full sample
 range, frame selection, all-frame stacking defaults, scales 1–4, output types,

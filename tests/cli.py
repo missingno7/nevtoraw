@@ -5,6 +5,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import array
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else "nevtoraw.exe").resolve()
 root = Path("out/cli-tests")
@@ -65,6 +66,27 @@ for command in ("dng", "stack"):
     assert struct.unpack("<I", data[257][2])[0] == 10
     assert data[33422][2] == bytes([0,1,1,2])  # BGGR input shifted by odd x/y.
     assert b"crop 3,5,12,10 sensor px" in path.read_bytes()
+
+# Small JPEG crops must keep each encoded row at the physical image width.
+# Check an independent raw decoder when one is available locally.
+small_jpeg = root / "small-jpeg"
+run("dng", source, "--crop", "3,5,96,80", "-o", small_jpeg)
+small_file = next(small_jpeg.glob("*.dng"))
+assert 273 in tags(small_file) and 324 not in tags(small_file)
+if shutil.which("dcraw"):
+    raw = subprocess.check_output(["dcraw", "-D", "-4", "-j", "-t", "0", "-c", str(small_file)])
+    magic, dimensions, white, samples = raw.split(b"\n", 3)
+    assert (magic, dimensions, white) == (b"P5", b"96 80", b"65535")
+    offset = struct.unpack("<I", tags(source)[273][2])[0]
+    stored = source.read_bytes()[offset:offset + 270*258*2]
+    expected = b"".join(stored[((y+5)*270+3)*2:((y+5)*270+99)*2] for y in range(80))
+    decoded = array.array("H")
+    decoded.frombytes(samples)
+    if sys.byteorder == "little":
+        decoded.byteswap()
+    wanted = array.array("H")
+    wanted.frombytes(expected)
+    assert decoded == wanted, "external decoder changed small JPEG crop rows"
 
 for scale in (1, 2, 3, 4):
     for bayer in (False, True):

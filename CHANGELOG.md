@@ -4,6 +4,7 @@
 
 - Shared NEV, NEF, and Bayer DNG input for conversion, stacking, SR, and folder inspection.
 - Shared `--crop` for conversion, stacking, and SR, preserving Bayer/black-level phase.
+- Lossless JPEG strips for small crops, avoiding padded-row decoding errors in raw converters.
 - Z 6/Z 7 support and broader Nikon decoders/calibrations reused from nefcomp.
 - Homography by default; all frames by default for stacking.
 - Robust mean, median, and trimmed-mean Bayer stacking with per-CFA black correction.
