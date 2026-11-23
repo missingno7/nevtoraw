@@ -39,9 +39,12 @@ struct Ifd {
     // offsets tag (0x0111 / 0x0144) pointing at blobs, plus counts tag
     void add_offsets(uint16_t off_tag, uint16_t cnt_tag, const std::vector<int> &blob_ids,
                      const std::vector<std::vector<uint8_t>> &blobs);
+    void add_offsets(uint16_t off_tag,uint16_t cnt_tag,const std::vector<uint32_t> &sizes);
 };
 
 // Serialize IFD0 (+ sub-IFDs) and blobs into a complete TIFF file.
 std::vector<uint8_t> build(Ifd &ifd0, const std::vector<std::vector<uint8_t>> &blobs);
+struct Layout {std::vector<uint8_t> header;std::vector<uint32_t> offsets;uint64_t size=0;};
+Layout layout(Ifd &ifd0,const std::vector<uint32_t> &sizes);
 
 } // namespace tiffw

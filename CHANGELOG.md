@@ -8,6 +8,10 @@
 - Z 6/Z 7 support and broader Nikon decoders/calibrations reused from nefcomp.
 - 98 Nikon RGB calibrations, normalized model aliases, and a `cameras` catalog command.
 - Older Nikon/Coolpix white balance, NRW CFA and black-level metadata, and D1X sensor aspect.
+- Shared persistent workers, bounded decode prefetch, automatic RAM budgeting, and
+  disk-backed frame/output caches across conversion, stacking, and SR.
+- Common `--memory-limit`, `--threads`, and `--temp-dir`; stage work timings and
+  streamed atomic DNG output without a second complete file buffer.
 - Homography by default; all frames by default for stacking.
 - Robust mean, median, and trimmed-mean Bayer stacking with per-CFA black correction.
 - 1x–4x raw SR; 2x LinearRaw and sigma 0.30 by default.

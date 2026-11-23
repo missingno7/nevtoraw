@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <functional>
 
 namespace nev {
 
@@ -21,6 +23,10 @@ struct DngOptions {
 
 bool has_color_profile(const MovieInfo &movie, const FrameInfo &frame);
 std::vector<std::string> calibrated_cameras();
+using PixelReader=std::function<void(unsigned,unsigned,unsigned,unsigned,uint16_t*)>;
+PixelReader pixel_reader(const std::vector<uint16_t> &pixels,unsigned width,unsigned channels=1);
+bool write_dng(const std::filesystem::path &path,const PixelReader &read,unsigned width,unsigned height,const MovieInfo &movie,
+               const FrameInfo &info,size_t frame,const std::string &name,const DngOptions &options,std::string &err);
 
 // Build a DNG from a Bayer mosaic or interleaved camera-native RGB samples.
 std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned width, unsigned height, const MovieInfo &mi,

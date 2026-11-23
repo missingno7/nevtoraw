@@ -4,15 +4,15 @@
 #include "lj92.h"
 #include "tiffw.h"
 #include "version.h"
+#include "cache.h"
+#include "file_io.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <thread>
 #include <stdexcept>
 
 namespace nev {
@@ -101,13 +101,12 @@ std::vector<std::string> calibrated_cameras() {
     return models;
 }
 
-std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsigned H, const MovieInfo &mi,
+static tiffw::Ifd dng_metadata(unsigned W, unsigned H, const MovieInfo &mi,
                                const FrameInfo &fi, size_t frame_index, const std::string &original_name,
                                const DngOptions &opt) {
     using namespace tiffw;
     const unsigned channels = opt.linear_rgb ? 3 : 1;
-    if (!W || !H || (!opt.linear_rgb && (W < 2 || H < 2)) ||
-        uint64_t(W) * H * channels != px.size()) throw std::runtime_error("invalid output sample geometry");
+    if (!W || !H || (!opt.linear_rgb && (W < 2 || H < 2))) throw std::runtime_error("invalid output sample geometry");
     if (opt.black_level >= opt.white_level || opt.white_level > 65535)
         throw std::runtime_error("invalid output black/white levels");
     if (!opt.linear_rgb) {
@@ -118,75 +117,14 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
             if (!std::isfinite(delta) || opt.black_level + delta < 0 || opt.black_level + delta >= opt.white_level)
                 throw std::runtime_error("invalid output CFA black level");
     }
-    if (uint64_t(px.size()) * 2 > UINT32_MAX - (1u << 20))
+    if (uint64_t(W) * H * channels * 2 > UINT32_MAX - (1u << 20))
         throw std::runtime_error("output exceeds classic TIFF's 4 GiB limit; use a smaller crop or scale");
-    std::vector<std::vector<uint8_t>> blobs;
     Ifd raw;
     raw.add_long(0x00fe, {0});
-    raw.add_long(0x0100, {W});
-    raw.add_long(0x0101, {H});
+    raw.add_long(0x0100, {W});raw.add_long(0x0101, {H});
     raw.add_short(0x0102, std::vector<uint16_t>(channels, 16));
     raw.add_short(0x0106, {uint16_t(opt.linear_rgb ? 34892 : 32803)});
-    raw.add_short(0x0115, {uint16_t(channels)});
-    raw.add_short(0x011c, {1});
-    if (opt.compression == DngCompression::None) {
-        raw.add_short(0x0103, {1});
-        std::vector<uint8_t> b(px.size() * 2);
-        memcpy(b.data(), px.data(), b.size());  // host is little-endian
-        blobs.push_back(std::move(b));
-        raw.add_long(0x0116, {H});
-        raw.add_offsets(0x0111, 0x0117, {0}, blobs);
-    } else if (W < 256) {
-        // Keep JPEG rows at the actual image width. Padded tiles wider than a
-        // small image are misinterpreted as successive rows by some raw readers.
-        const unsigned rows = std::min(H,256u);
-        std::vector<int> ids;
-        for (unsigned y = 0; y < H; y += rows) {
-            const auto *samples = px.data() + size_t(y) * W * channels;
-            const unsigned height = std::min(rows,H-y);
-            ids.push_back(int(blobs.size()));
-            blobs.push_back(opt.linear_rgb ? lj92::encode_rgb_tile(samples,W,height,3*W,16)
-                                           : lj92::encode_cfa_tile(samples,W,height,W,16));
-        }
-        raw.add_short(0x0103, {7});
-        raw.add_long(0x0116, {rows});
-        raw.add_offsets(0x0111,0x0117,ids,blobs);
-    } else {
-        const unsigned T = 256;
-        unsigned tx = (W + T - 1) / T, ty = (H + T - 1) / T;
-        std::vector<std::vector<uint8_t>> tiles(size_t(tx) * ty);
-        std::atomic<size_t> next{0};
-        unsigned nt = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
-        nt = unsigned(std::min<size_t>(nt, tiles.size()));
-        auto work = [&]() {
-            std::vector<uint16_t> buf(size_t(T) * T * channels);
-            for (size_t k; (k = next++) < tiles.size();) {
-                unsigned x0 = unsigned(k % tx) * T, y0 = unsigned(k / tx) * T;
-                // pad by repeating the last same-colour column/row
-                for (unsigned y = 0; y < T; y++) {
-                    unsigned sy = y0 + y;
-                    if (sy >= H) sy = opt.linear_rgb ? H - 1 : H - 2 + ((sy - H) & 1);
-                    const uint16_t *src = px.data() + size_t(sy) * W * channels;
-                    for (unsigned x = 0; x < T; x++) {
-                        unsigned sx = x0 + x;
-                        if (sx >= W) sx = opt.linear_rgb ? W - 1 : W - 2 + ((sx - W) & 1);
-                        std::copy_n(src + sx * channels, channels, buf.data() + (size_t(y) * T + x) * channels);
-                    }
-                }
-                tiles[k] = opt.linear_rgb ? lj92::encode_rgb_tile(buf.data(), T, T, 3 * T, 16)
-                                          : lj92::encode_cfa_tile(buf.data(), T, T, T, 16);
-            }
-        };
-        std::vector<std::thread> th;
-        for (unsigned i = 0; i < nt; i++) th.emplace_back(work);
-        for (auto &t : th) t.join();
-        std::vector<int> ids;
-        for (auto &t : tiles) { ids.push_back(int(blobs.size())); blobs.push_back(std::move(t)); }
-        raw.add_short(0x0103, {7});
-        raw.add_long(0x0142, {T});
-        raw.add_long(0x0143, {T});
-        raw.add_offsets(0x0144, 0x0145, ids, blobs);
-    }
+    raw.add_short(0x0115, {uint16_t(channels)});raw.add_short(0x011c, {1});
     if (!opt.linear_rgb) {
         raw.add_short(0x828d, {2, 2});
         raw.add_bytes(0x828e, BYTE, {uint8_t(fi.cfa[0]), uint8_t(fi.cfa[1]), uint8_t(fi.cfa[2]), uint8_t(fi.cfa[3])});
@@ -301,7 +239,91 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
     if (!mi.lens_serial.empty()) exif->add_ascii(0xa435, mi.lens_serial);
     ifd0.add_sub(0x8769, {exif});
 
-    return build(ifd0, blobs);
+    return raw;
+}
+
+
+namespace {
+void encode_dng(const PixelReader &read,unsigned W,unsigned H,const MovieInfo &mi,const FrameInfo &fi,
+                size_t frame,const std::string &name,const DngOptions &opt,
+                const std::function<void(const tiffw::Layout&,const ArrayStore&,const std::vector<size_t>&,const std::vector<uint32_t>&)> &save) {
+    StageTimer timer(Stage::Write);
+    auto metadata=dng_metadata(W,H,mi,fi,frame,name,opt);
+    const unsigned channels=opt.linear_rgb?3:1;
+    const bool jpeg=opt.compression==DngCompression::LosslessJpeg,tiled=jpeg&&W>=256;
+    unsigned tile_w=tiled?256:W,tile_h=jpeg?256:64;
+    while(!jpeg&&tile_h>1&&uint64_t(tile_w)*tile_h*channels*10+(1<<20)>runtime().available())tile_h/=2;
+    unsigned columns=tiled?(W+tile_w-1)/tile_w:1,rows=(H+tile_h-1)/tile_h;
+    const uint64_t scratch_per_worker=uint64_t(tile_w)*tile_h*channels*10+(1<<20);
+    unsigned workers=opt.threads?std::min(opt.threads,runtime().threads()):runtime().threads();
+    unsigned concurrency=unsigned(std::min<uint64_t>({workers,uint64_t(columns)*rows,runtime().available()/scratch_per_worker}));
+    auto workspace=runtime().reserve(scratch_per_worker*std::max(1u,concurrency));
+    ArrayStore blobs;std::vector<size_t> ids(size_t(columns)*rows);std::vector<uint32_t> sizes(ids.size());
+    runtime().parallel(ids.size(),[&](size_t k){
+        unsigned x0=unsigned(k%columns)*tile_w,y0=unsigned(k/columns)*tile_h;
+        unsigned width=std::min(tile_w,W-x0),height=std::min(tile_h,H-y0);
+        unsigned ew=tiled?tile_w:width,eh=tiled?tile_h:height;
+        std::vector<uint16_t> samples(size_t(ew)*eh*channels);
+        unsigned source_left=(!opt.linear_rgb&&width==1&&x0)?x0-1:x0;
+        unsigned source_width=x0+width-source_left;
+        std::vector<uint16_t> row(size_t(source_width)*channels);
+        for(unsigned y=0;y<eh;++y){
+            unsigned sy=y0+y;if(sy>=H)sy=opt.linear_rgb?H-1:H-2+((sy-H)&1);
+            read(source_left,sy,source_width,1,row.data());
+            auto *dst=samples.data()+size_t(y)*ew*channels;
+            for(unsigned x=0;x<ew;++x){
+                unsigned sx=x0+x;if(sx>=W)sx=opt.linear_rgb?W-1:W-2+((sx-W)&1);
+                std::copy_n(row.data()+size_t(sx-source_left)*channels,channels,dst+size_t(x)*channels);
+            }
+        }
+        std::vector<uint8_t> encoded;
+        if(jpeg)encoded=opt.linear_rgb?lj92::encode_rgb_tile(samples.data(),ew,eh,3*ew,16):lj92::encode_cfa_tile(samples.data(),ew,eh,ew,16);
+        else {encoded.resize(samples.size()*2);std::memcpy(encoded.data(),samples.data(),encoded.size());}
+        sizes[k]=uint32_t(encoded.size());ids[k]=blobs.put(std::move(encoded));
+    },std::max(1u,concurrency));
+    metadata.add_short(0x0103,{uint16_t(jpeg?7:1)});
+    if(tiled){metadata.add_long(0x0142,{tile_w});metadata.add_long(0x0143,{tile_h});metadata.add_offsets(0x0144,0x0145,sizes);}
+    else {metadata.add_long(0x0116,{tile_h});metadata.add_offsets(0x0111,0x0117,sizes);}
+    save(tiffw::layout(metadata,sizes),blobs,ids,sizes);
+}
+void emit_dng(std::ostream &file,const tiffw::Layout &layout,const ArrayStore &blobs,
+              const std::vector<size_t> &ids,const std::vector<uint32_t> &sizes){
+    file.write(reinterpret_cast<const char*>(layout.header.data()),std::streamsize(layout.header.size()));
+    uint64_t position=layout.header.size();const char zero=0;
+    std::vector<uint8_t> buffer(1<<20);
+    for(size_t i=0;i<ids.size();++i){
+        while(position<layout.offsets[i]){file.put(zero);++position;}
+        for(uint64_t offset=0;offset<sizes[i];){
+            size_t n=size_t(std::min<uint64_t>(buffer.size(),sizes[i]-offset));blobs.read(ids[i],offset,buffer.data(),n);
+            file.write(reinterpret_cast<const char*>(buffer.data()),std::streamsize(n));offset+=n;position+=n;
+            if(!file)throw std::runtime_error("could not write DNG output");
+        }
+    }
+}
+}
+PixelReader pixel_reader(const std::vector<uint16_t> &px,unsigned width,unsigned channels){
+    return [&px,width,channels](unsigned x,unsigned y,unsigned w,unsigned h,uint16_t *data){
+        for(unsigned row=0;row<h;++row)std::copy_n(px.data()+(size_t(y+row)*width+x)*channels,size_t(w)*channels,data+size_t(row)*w*channels);
+    };
+}
+std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px,unsigned W,unsigned H,const MovieInfo &mi,
+                            const FrameInfo &fi,size_t frame,const std::string &name,const DngOptions &opt){
+    if(uint64_t(W)*H*(opt.linear_rgb?3:1)!=px.size())throw std::runtime_error("invalid output sample geometry");
+    std::vector<uint8_t> result;
+    encode_dng(pixel_reader(px,W,opt.linear_rgb?3:1),W,H,mi,fi,frame,name,opt,
+        [&](const auto &layout,const auto &blobs,const auto &ids,const auto &sizes){
+            result=layout.header;result.resize(size_t(layout.size),0);
+            for(size_t i=0;i<ids.size();++i)blobs.read(ids[i],0,result.data()+layout.offsets[i],sizes[i]);
+        });
+    return result;
+}
+bool write_dng(const std::filesystem::path &path,const PixelReader &read,unsigned W,unsigned H,const MovieInfo &mi,
+               const FrameInfo &fi,size_t frame,const std::string &name,const DngOptions &opt,std::string &err){
+    bool ok=false;
+    try {encode_dng(read,W,H,mi,fi,frame,name,opt,[&](const auto &layout,const auto &blobs,const auto &ids,const auto &sizes){
+        ok=write_atomic(path,[&](std::ostream &file){emit_dng(file,layout,blobs,ids,sizes);},err);
+    });}catch(const std::exception &e){err=path.u8string()+": "+e.what();}
+    return ok;
 }
 
 } // namespace nev

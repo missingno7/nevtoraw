@@ -34,6 +34,9 @@ folder conversion/inspection, Unicode paths, invalid options, and source protect
 Nikon fixtures cover native NEF/NRW folder input, old/NRW white-balance blocks,
 Coolpix black-level scales, model aliases/calibration selection, the DCP importer,
 and D1X sensor aspect. Tests use synthetic metadata, not bundled camera originals.
+Execution checks compare resident and forced disk-backed median/trimmed stacks
+and SR outputs, verify worker/prefetch exceptions, nested pool work, scratch-file
+cleanup, streamed write failure atomicity, and shared memory/thread CLI controls.
 
 Where local camera files are available, additionally exercise:
 

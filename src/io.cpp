@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include "io.h"
+#include "file_io.h"
 #include <fstream>
 #include <random>
 #include <system_error>
@@ -19,7 +19,7 @@ FILE *open_file(const std::string &path, const char *mode) {
 #endif
 }
 
-bool write_atomic(const std::filesystem::path &path, const std::vector<uint8_t> &bytes, std::string &err) {
+bool write_atomic(const std::filesystem::path &path,const std::function<void(std::ostream&)> &write,std::string &err) {
     namespace fs = std::filesystem;
     fs::path temporary;
     try {
@@ -30,8 +30,8 @@ bool write_atomic(const std::filesystem::path &path, const std::vector<uint8_t> 
         } while (fs::exists(temporary));
         {
             std::ofstream file(temporary, std::ios::binary);
-            if (!file.write(reinterpret_cast<const char *>(bytes.data()), std::streamsize(bytes.size())))
-                throw std::runtime_error("could not write output");
+            write(file);
+            if (!file) throw std::runtime_error("could not write output");
             file.close();
             if (!file) throw std::runtime_error("could not close output");
         }
@@ -48,5 +48,8 @@ bool write_atomic(const std::filesystem::path &path, const std::vector<uint8_t> 
         err = path.u8string() + ": " + e.what();
         return false;
     }
+}
+bool write_atomic(const std::filesystem::path &path,const std::vector<uint8_t> &bytes,std::string &err) {
+    return write_atomic(path,[&](std::ostream &file){file.write(reinterpret_cast<const char*>(bytes.data()),std::streamsize(bytes.size()));},err);
 }
 } // namespace nev

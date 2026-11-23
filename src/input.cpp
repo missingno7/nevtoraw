@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "input.h"
+#include "runtime.h"
 #include <algorithm>
 #include <cctype>
 
@@ -37,6 +38,7 @@ bool InputSource::open(const fs::path &input, std::string &err) {
     return true;
 }
 bool InputSource::read(size_t index, RawPhoto &p, std::string &err) const {
+    StageTimer timer(Stage::Decode);
     if (index >= size()) { err = "frame index out of range"; return false; }
     if (!photos_.empty()) return read_raw_photo(photos_[index].u8string(), p, err);
     Frame frame;

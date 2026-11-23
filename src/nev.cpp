@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "nev.h"
 #include "he_decode.h"
-#include "io.h"
+#include "file_io.h"
 
 #include <cstring>
 
@@ -141,7 +141,10 @@ bool File::read_frame(size_t i, Frame &f, std::string &err) const {
     if (i >= offsets.size()) { err = "frame index out of range"; return false; }
     f = Frame{};
     f.data.resize(sizes[i]);
-    if (!fread_at(fp, offsets[i], f.data.data(), f.data.size())) { err = "read frame"; return false; }
+    {
+        std::lock_guard<std::mutex> lock(io_mutex);
+        if (!fread_at(fp, offsets[i], f.data.data(), f.data.size())) { err = "read frame"; return false; }
+    }
     auto &d = f.data;
     if (d.size() < 16 || memcmp(&d[4], "NRAW", 4) || be32(&d[0]) != d.size()) { err = "not an NRAW sample"; return false; }
     size_t cs = 0;

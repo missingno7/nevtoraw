@@ -3,6 +3,7 @@
 
 #include "raw.h"
 #include "stack.h"
+#include "cache.h"
 
 namespace nev {
 
@@ -17,6 +18,7 @@ struct SrImage {
     unsigned width = 0, height = 0, black = 0, white = 0;
     bool linear = false;
     std::vector<uint16_t> pixels;
+    std::shared_ptr<TiledImage> storage; // large output, bounded RAM with disk backing
 };
 
 using SaveSr = std::function<bool(size_t, const SrImage &, const MovieInfo &, const FrameInfo &)>;

@@ -3,6 +3,7 @@
  * lifetime/complete-frame/entropy bounds and defined signed arithmetic.
  * See runtime-source-receipt.json and the two patches in the parent folder.
  * Original copyright and dual-license notices follow unchanged. */
+/* nevtoraw modification, 2026-11-23: thread-local mutable layout state. */
 /* -*- C++ -*-
  * File: nikon_he_subband_config.cpp
  * Copyright (C) 2026 Dmitri Sotnikov
@@ -135,7 +136,7 @@ void compute_subband_layout(int half_pass_W, SubbandConfig out[26]) {
     int passB_hl_offset[2] = {0, round_up(ng_max, 8)};
 
     // --- Shared LayoutInfo ---
-    static LayoutInfo layout_info;
+    static thread_local LayoutInfo layout_info;
     layout_info.ng_max = ng_max;
     layout_info.ng_LL  = ng_LL;
     layout_info.sample_width = half_pass_W;

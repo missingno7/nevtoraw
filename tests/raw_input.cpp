@@ -5,15 +5,20 @@
 #include "sr.h"
 #include "input.h"
 #include "selection.h"
-#include "io.h"
+#include "file_io.h"
 #include "tiffr.h"
 #include "tiffw.h"
+#include "runtime.h"
+#include "cache.h"
+#include "read_queue.h"
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 
 namespace fs = std::filesystem;
@@ -293,6 +298,26 @@ static void shared_crop(const fs::path &dir) {
 }
 
 static void small_jpeg_strips(const fs::path &dir) {
+    // Last Bayer tiles can contain only one real row/column. Padding must
+    // retain sensor phase even when its same-color neighbor is in another tile.
+    {
+        const unsigned w=257,h=257;std::vector<uint16_t> pixels(w*h);
+        for(size_t i=0;i<pixels.size();++i)pixels[i]=uint16_t(i*1777u+13u);
+        nev::DngOptions options;options.white_level=65535;options.black_level=0;
+        auto bytes=nev::build_dng(pixels,w,h,camera(),nev::FrameInfo{},0,"source",options);
+        auto t=tiffr::open(bytes);auto d=t.directory(t.number(4));
+        for(unsigned tile=0;tile<4;++tile){
+            size_t offset=t.scalar(d,0x144,0,tile),size=t.scalar(d,0x145,0,tile);
+            std::vector<uint16_t> decoded;std::string error;
+            require(lj92::decode_tile(t.at(offset,size),size,256*256,decoded,error),error.c_str());
+            for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x){
+                unsigned sx=(tile%2)*256+x,sy=(tile/2)*256+y;
+                if(sx>=w)sx=w-2+((sx-w)&1);
+                if(sy>=h)sy=h-2+((sy-h)&1);
+                require(decoded[y*256+x]==pixels[sy*w+sx],"Bayer JPEG edge padding changed sensor phase");
+            }
+        }
+    }
     for(unsigned w:{95u,96u}) {
         const unsigned h=270;
         std::vector<uint16_t> pixels(w*h);
@@ -435,6 +460,87 @@ static void native_nikon_fixture(const fs::path &dir) {
     require(t.real(d,0xc61e,1,0)==.75&&t.real(d,0xc61e,1,1)==1.5,"D1X DNG aspect wrong");
 }
 
+static void execution_runtime(const fs::path &dir) {
+    uint64_t bytes;
+    require(nev::parse_memory("8G",bytes)&&bytes==(uint64_t(8)<<30),"RAM units wrong");
+    require(nev::parse_memory("512MiB",bytes)&&bytes==(uint64_t(512)<<20),"MiB units wrong");
+    for(const char *bad:{"0","-1G","1.5G","8Q","18446744073709551616G"})
+        require(!nev::parse_memory(bad,bytes),"invalid RAM limit accepted");
+    auto scratch=dir/"runtime-scratch";fs::create_directories(scratch);
+    nev::configure_runtime({uint64_t(24)<<20,4,scratch});
+    std::atomic<unsigned> count{0};
+    nev::runtime().parallel(16,[&](size_t){nev::runtime().parallel(4,[&](size_t){++count;});});
+    require(count==64,"nested pool tasks lost work");
+    bool caught=false;
+    try{nev::runtime().parallel(32,[](size_t i){if(i==3)throw std::runtime_error("worker failure");});}catch(const std::runtime_error&){caught=true;}
+    require(caught,"worker exception not propagated");
+    count=0;nev::runtime().parallel(16,[&](size_t){++count;});require(count==16,"pool unusable after failure");
+    {
+        nev::ReadPhoto read=[](size_t i,nev::RawPhoto &photo,std::string&){photo.pixels={uint16_t(i)};if(i==2)throw std::runtime_error("decode failure");return true;};
+        caught=false;
+        try{nev::ReadQueue queue(read,{0,1,2,3,4},1<<20);for(size_t i=0;i<5;++i){nev::RawPhoto photo;std::string error;require(queue.read(i,photo,error)&&photo.pixels[0]==i,"prefetch changed frame order");}}
+        catch(const std::runtime_error &e){caught=std::string(e.what())=="decode failure";}
+        require(caught,"prefetch did not propagate decode failure");
+    }
+    {
+        auto held=nev::runtime().reserve((uint64_t(24)<<20)-1024);
+        nev::ArrayStore cache;std::vector<uint16_t> source(10000);
+        for(size_t i=0;i<source.size();++i)source[i]=uint16_t(i);
+        auto id=cache.put(std::move(source));require(cache.spilled()==20000,"RAM budget did not trigger disk backing");
+        std::vector<uint16_t> part(400);cache.read(id,3000*2,part.data(),part.size()*2);
+        for(size_t i=0;i<part.size();++i)require(part[i]==3000+i,"scratch range read changed samples");
+        held=nev::MemoryLease{};
+        auto resident=cache.put(std::vector<uint16_t>(1000,42));
+        require(cache.release_memory(2000)==2000,"resident cache could not free space at a phase boundary");
+        std::vector<uint16_t> restored(1000);cache.read(resident,0,restored.data(),2000);
+        require(std::all_of(restored.begin(),restored.end(),[](auto v){return v==42;}),"eviction changed cached samples");
+        held=nev::runtime().reserve((uint64_t(24)<<20)-1024);
+        nev::TiledImage image(257,259,3,64);
+        for(unsigned y=0;y<259;y+=64)for(unsigned x=0;x<257;x+=64){
+            unsigned w=std::min(64u,257-x),h=std::min(64u,259-y);std::vector<uint16_t> tile(size_t(w)*h*3);
+            for(unsigned row=0;row<h;++row)for(unsigned col=0;col<w;++col)for(unsigned c=0;c<3;++c)
+                tile[(size_t(row)*w+col)*3+c]=uint16_t((y+row)*97+x+col+c);
+            image.put(x,y,w,h,tile.data());
+        }
+        std::vector<uint16_t> region(130*133*3);image.read(63,65,130,133,region.data());
+        for(unsigned y=0;y<133;++y)for(unsigned x=0;x<130;++x)for(unsigned c=0;c<3;++c)
+            require(region[(y*130+x)*3+c]==(y+65)*97+x+63+c,"cached output tile seams changed samples");
+    }
+    require(fs::is_empty(scratch),"scratch files leaked after cache destruction");
+    nev::RawPhoto raw;raw.width=raw.height=256;raw.black=100;raw.white=16383;raw.movie=camera();
+    raw.pixels.resize(size_t(raw.width)*raw.height);
+    for(size_t i=0;i<raw.pixels.size();++i)raw.pixels[i]=uint16_t(1000+(i*73+(i/256)*151)%6000);
+    nev::ReadPhoto read=[&](size_t index,nev::RawPhoto &p,std::string&){p=raw;for(auto &v:p.pixels)v=uint16_t(v+index%13*17);return true;};
+    std::vector<size_t> selection(64);std::iota(selection.begin(),selection.end(),0);
+    for(auto merge:{nev::StackMerge::Median,nev::StackMerge::TrimmedMean}){
+        nev::StackOptions options;options.alignment=nev::StackAlignment::None;options.merge=merge;
+        nev::StackResult expected,actual;std::string error;bool spilled=false;
+        nev::configure_runtime({uint64_t(256)<<20,1,scratch});
+        require(nev::stack_frames(read,selection,32,options,expected,error,[](const auto&){}),error.c_str());
+        nev::configure_runtime({uint64_t(24)<<20,4,scratch});
+        require(nev::stack_frames(read,selection,32,options,actual,error,[&](const auto &message){spilled|=message.find("temporary storage")!=std::string::npos;}),error.c_str());
+        require(spilled&&actual.px==expected.px,"disk-backed stack changed the merge result");
+    }
+    std::vector<uint16_t> expected;
+    for(bool constrained:{false,true}){
+        nev::configure_runtime({uint64_t(constrained?24:256)<<20,constrained?2u:1u,scratch});
+        nev::SrOptions options;options.scale=4;std::string error;bool saved=false;
+        require(nev::superresolve(read,{0},0,options,[&](size_t,const nev::SrImage &image,const auto&,const auto&){
+            std::vector<uint16_t> values;
+            if(image.storage){values.resize(size_t(image.width)*image.height*3);image.storage->read(0,0,image.width,image.height,values.data());}
+            else values=image.pixels;
+            if(constrained)require(image.storage&&values==expected,"disk-backed SR output changed samples");else expected=std::move(values);
+            saved=true;return true;
+        },error,[](const auto&){}),error.c_str());require(saved,"SR cache output not delivered");
+    }
+    require(fs::is_empty(scratch),"scratch files leaked after algorithms finished");
+    nev::configure_runtime({uint64_t(256)<<20,4,{}});
+    auto atomic=dir/"streamed-output";write(atomic,{1,2,3});std::string error;
+    require(!nev::write_atomic(atomic,std::function<void(std::ostream&)>([](std::ostream &file){file<<"partial";throw std::runtime_error("write failure");}),error),"streamed write failure reported success");
+    std::ifstream file(atomic,std::ios::binary);std::vector<uint8_t> contents((std::istreambuf_iterator<char>(file)),{});
+    require(contents==std::vector<uint8_t>({1,2,3}),"failed streamed output replaced existing data");
+}
+
 static void jpeg_predictors() {
     // Independently specified 2x2 fixtures. Reduced-precision samples are
     // initial+[2,3,0,7]; these are the known final differences for predictors 1..7.
@@ -492,6 +598,7 @@ int main() {
         sr_black();
         stack_levels();input_source(dir);selection();atomic_output(dir);high_black(dir);jpeg_predictors();shared_crop(dir);small_jpeg_strips(dir);
         nikon_catalog(dir);native_nikon_fixture(dir);
+        execution_runtime(dir);
         std::cout<<"Raw input tests passed\n";return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

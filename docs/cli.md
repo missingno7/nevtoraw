@@ -29,6 +29,9 @@ and [capture-format limits](raw-formats.md).
 | `-c, --compression ljpeg\|none` | Lossless JPEG (default) or uncompressed 16-bit output. |
 | `--white N` | Override white level, integer 1–65535, above source black levels. NEV defaults to 16383. |
 | `--crop X,Y,W,H` | Physical output region in coded source/reference sensor pixels, before orientation and SR scaling. Minimum 2×2. |
+| `--memory-limit SIZE` | Automatic by default: 70% of available physical memory/commit headroom. Override with an integer size such as `8G`, `512M`, or `auto`; suffixes use powers of 1024. |
+| `--threads N` | Shared worker limit, 1–1024. Default logical CPU count. Memory availability can reduce active jobs. |
+| `--temp-dir DIR` | Existing directory for automatically deleted disk caches; default OS temporary directory. |
 | `-h, --help` | Show help, including after a command. |
 | `--version` | Print the program version. |
 
@@ -91,10 +94,12 @@ Read/format/compatibility failures stop stacking. Frames lacking a reliable
 homography are reported and skipped; failure to align any other selected frame
 is an error. Output metadata records the frames actually accepted.
 
-Mean stacking streams frames. Median/trimmed mean store aligned samples, roughly
-`width × height × accepted frames × 2 bytes`, plus working buffers. 16-bit inputs
-or high black offsets use 4-byte storage. For 45 MP × 32 frames, 2-byte storage
-alone is about 2.9 GB. Limit large bursts with `--count` or `--frames`.
+Mean stacking streams frames. Median/trimmed mean cache aligned samples, roughly
+`width × height × accepted frames × 2 bytes`. 16-bit inputs or high black offsets
+use 4-byte storage. This cache shares the automatic RAM budget and spills to disk
+as needed. The merge reads bounded spatial chunks across all accepted frames,
+preserving the per-pixel median/trimmed mean. Working-memory minimums still scale
+with sensor dimensions. See [execution and memory](runtime.md).
 
 Output scales values by `floor(65535 / reference_white)`, retaining fractional
 averages in 16 bits where source headroom permits. This is ×4 for 14-bit sources
@@ -116,10 +121,13 @@ samples and need more subpixel coverage. Very small sigmas can leave sparse area
 dependent on interpolation from the reference. Scale 1 is useful for native-size
 linear raw; 2 is the general default; 3/4 suit detailed scenes and longer bursts.
 
-SR retains every selected raw frame, roughly 2 bytes per source pixel per frame,
-plus alignment, reconstruction, and output buffers. LinearRaw has three channels,
-so full-frame 4x output needs 16× the pixels and 48× the source sample count.
-Start with a crop. Classic TIFF/DNG output is limited to 4 GiB.
+SR caches selected raw frames, roughly 2 bytes per source pixel per frame,
+using the shared RAM budget and temporary storage. Reconstruction loads only the
+source regions needed by an output tile. Large reconstructed outputs are also
+cached in tiles when a complete output buffer would exceed the budget. Small
+crops use smaller jobs to improve CPU utilization. LinearRaw has three channels;
+classic TIFF/DNG output remains limited to 4 GiB. Crop reduces output/reconstruction
+work; full sensor decoding/alignment still requires working memory.
 
 SR stops on source, compatibility, or homography failures, reporting the affected
 frame. It does not substitute frames. Subject motion and saturated samples have

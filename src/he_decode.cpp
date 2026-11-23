@@ -8,12 +8,10 @@
 #include "nikon_he_picture_header.h"
 
 #include <algorithm>
-#include <mutex>
 
 namespace nefcomp {
 
 namespace {
-std::mutex g_mutex;  // the public decoder keeps the active header in a global
 inline unsigned be16(const uint8_t *p) { return unsigned(p[0]) << 8 | p[1]; }
 inline int64_t floor_div(int64_t v, unsigned s) {
     return v >= 0 ? v >> s : -(((-v) + (INT64_C(1) << s) - 1) >> s);
@@ -21,7 +19,6 @@ inline int64_t floor_div(int64_t v, unsigned s) {
 } // namespace
 
 bool he_decode(const uint8_t *cs, size_t len, unsigned w, unsigned h, std::vector<uint16_t> &out, std::string &err) {
-    std::lock_guard<std::mutex> lock(g_mutex);
     nikon_he::PictureHeader ph{};
     if (!nikon_he::parse_picture_header(cs, len, ph) || !nikon_he::is_supported_picture_header(ph, len)) {
         err = "unsupported picture header"; return false;
@@ -42,9 +39,9 @@ bool he_decode(const uint8_t *cs, size_t len, unsigned w, unsigned h, std::vecto
     }
     out.assign(size_t(w) * h, 0);
     nikon_he::set_active_picture_header(&ph);
+    struct ResetHeader { ~ResetHeader(){nikon_he::set_active_picture_header(nullptr);} } reset_header;
     auto r = nikon_he::decode_nikon_he_image(cs + ph.precinct_offset, len - ph.precinct_offset, int(w), int(h),
                                               lut.data(), out.data());
-    nikon_he::set_active_picture_header(nullptr);
     if (!r.success) { err = "precinct decode failed"; return false; }
     return true;
 }

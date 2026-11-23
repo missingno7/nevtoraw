@@ -6,6 +6,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <mutex>
 
 namespace nev {
 
@@ -30,6 +31,7 @@ unsigned black_level(const Frame &fr);
 
 struct File {
     FILE *fp = nullptr;
+    mutable std::mutex io_mutex;
     uint64_t size = 0;
     unsigned width = 0, height = 0;
     uint32_t timescale = 0;

@@ -3,16 +3,17 @@
 #include "sr.h"
 
 #include "meta.h"
+#include "cache.h"
+#include "read_queue.h"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <random>
-#include <thread>
 
 namespace nev {
 
@@ -27,20 +28,11 @@ struct Img {
     float at(int x, int y) const { return d[size_t(y) * w + x]; }
 };
 
-unsigned g_threads = 1;
-
-// Run fn(begin, end) over [0, n) in parallel chunks.
-template <class F> void parallel_for(int n, F fn) {
-    unsigned nt = std::min<unsigned>(g_threads, unsigned(std::max(n, 1)));
-    if (nt <= 1) { fn(0, n); return; }
-    std::atomic<int> next{0};
-    const int chunk = std::max(1, n / int(nt * 8));
-    std::vector<std::thread> th;
-    for (unsigned t = 0; t < nt; t++)
-        th.emplace_back([&]() {
-            for (int b; (b = next.fetch_add(chunk)) < n;) fn(b, std::min(n, b + chunk));
-        });
-    for (auto &t : th) t.join();
+// Reuse the process worker pool across all image stages.
+template <class F> void parallel_for(int n,F fn){
+    if(n<=0)return;
+    int chunk=std::max(1,n/int(runtime().threads()*8));
+    runtime().parallel(size_t((n+chunk-1)/chunk),[&](size_t k){int first=int(k)*chunk;fn(first,std::min(n,first+chunk));});
 }
 
 // A decoded frame split into its four CFA planes (black-subtracted, exposure-normalised).
@@ -723,7 +715,6 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
     const bool trimmed = opt.merge == StackMerge::TrimmedMean;
     if (trimmed && opt.trim_percent > 49) { err = "trim percentage must be 0..49"; return false; }
     const bool per_sample = opt.merge != StackMerge::Mean;
-    g_threads = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
     if (frames.empty() || !std::binary_search(frames.begin(), frames.end(), ref) ||
         std::adjacent_find(frames.begin(), frames.end(), std::greater_equal<size_t>{}) != frames.end()) {
         err = "selected frames must be sorted, unique and include the reference"; return false;
@@ -735,6 +726,9 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
     if (!resolve_crop(opt.crop,reference.width,reference.height,crop,err)) return false;
     if (opt.tile < 8 || opt.tile > 256) { err = "alignment tile must be 16..512 sensor pixels"; return false; }
     const unsigned W = reference.width, H = reference.height;
+    auto workspace=runtime().reserve(uint64_t(W)*H*40+(16<<20));
+    std::vector<size_t> pending;for(size_t index:frames)if(index!=ref)pending.push_back(index);
+    ReadQueue reader(read,std::move(pending),uint64_t(W)*H*32);
     const float black = float(reference.black);
     auto clipping = [](unsigned white) { return white - (white > 512 ? (white + 63) / 64 : 0); };
     const unsigned clip_level = clipping(reference.white);
@@ -755,20 +749,20 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
     // accumulators: start with the reference at weight 1 (clipped reference quads stay reference-only)
     Planes acc = R;
     Img wsum(R.w, R.h, 1.0f);
-    std::vector<std::vector<uint16_t>> store; // compact half-DN samples for 12/14-bit sources
-    std::vector<std::vector<float>> precise_store; // preserve the range of 16-bit DNGs
+    ArrayStore cached_samples;
+    std::vector<size_t> store;
     const bool precise = reference.white > 16383 ||
         std::any_of(std::begin(ref_info.black_delta), std::end(ref_info.black_delta),
                     [&](float delta) { return black + delta > 2047; });
     auto store_frame = [&](const Planes &p, const std::vector<uint8_t> *valid) {
-        if (!precise) { store.push_back(encode(p, valid)); return; }
+        if (!precise) { store.push_back(cached_samples.put(encode(p, valid))); return; }
         size_t plane = size_t(p.w) * p.h;
         std::vector<float> samples(4 * plane, std::numeric_limits<float>::quiet_NaN());
         for (size_t i = 0; i < plane; ++i) {
             if (valid && !(*valid)[i]) continue;
             for (unsigned k = 0; k < 4; ++k) samples[k*plane+i] = p.p[k].d[i];
         }
-        precise_store.push_back(std::move(samples));
+        store.push_back(cached_samples.put(std::move(samples)));
     };
     if (per_sample) store_frame(R, nullptr);
     NoiseModel nm;
@@ -779,7 +773,7 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
     for (size_t idx : frames) {
         if (idx == ref) continue;
         RawPhoto photo;
-        if (!read(idx, photo, err)) { err = "frame " + std::to_string(idx) + ": " + err; return false; }
+        if (!reader.read(idx, photo, err)) { err = "frame " + std::to_string(idx) + ": " + err; return false; }
         const bool compatible = compatible_photos(reference, photo);
         if (!compatible) { err = "frame " + std::to_string(idx) + ": incompatible raw geometry, CFA or calibration"; return false; }
         const double sc = exposure_scale(ref_info, photo.info) * double(reference.white-reference.black) / (photo.white-photo.black);
@@ -788,6 +782,7 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
         Homography h;
         size_t inliers = 0, matched = 0;
         if (aligned) {
+            StageTimer timer(Stage::Align);
             Img g = grey(F);
             fd = align(rpyr, pyramid(g), int(opt.tile));
             if (projective) {
@@ -800,6 +795,7 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
                 }
             }
         }
+        StageTimer merge_timer(Stage::Merge);
         warp(F, aligned && !projective ? &fd : nullptr, projective ? &h : nullptr, Wp, valid);
         double wtot = 0;
         if (per_sample) {
@@ -877,34 +873,45 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
     }
 
     if (per_sample) {
-        // Merge the frames that cover each sample (the reference always does).
-        parallel_for(R.h, [&](int y0, int y1) {
-            std::vector<float> values(precise ? precise_store.size() : store.size());
-            const size_t plane = size_t(R.w) * R.h;
-            for (int y = y0; y < y1; y++)
-                for (int x = 0; x < R.w; x++) {
-                    size_t o = size_t(y) * R.w + x;
-                    if (R.clip[o]) continue;  // clipped reference quad: keep the reference
-                    for (int k = 0; k < 4; k++) {
-                        size_t n = 0;
-                        if (precise) {
-                            for (auto &s : precise_store)
-                                if (float v = s[k*plane+o]; std::isfinite(v)) values[n++] = v;
-                        } else for (auto &s : store)
-                            if (uint16_t u = s[k * plane + o]) values[n++] = decode_sample(u);
-                        if (trimmed) {
-                            acc.p[k].d[o] = trimmed_mean(values.data(), values.data() + n, opt.trim_percent);
-                            continue;
-                        }
-                        auto mid = values.begin() + long(n / 2);
-                        std::nth_element(values.begin(), mid, values.begin() + long(n));
-                        float m = *mid;
-                        if (!(n & 1)) m = 0.5f * (m + *std::max_element(values.begin(), mid));
-                        acc.p[k].d[o] = m;
+        StageTimer timer(Stage::Merge);
+        const size_t plane=size_t(R.w)*R.h,bytes=precise?4:2;
+        const uint64_t row_bytes=uint64_t(store.size())*4*R.w*bytes+store.size()*sizeof(float);
+        // The merge scratch is part of the reserved working allowance. Lower
+        // concurrency automatically when even one row per worker is expensive.
+        uint64_t scratch_budget=uint64_t(W)*H*8;
+        MemoryLease extra_scratch;
+        if(row_bytes>scratch_budget){
+            uint64_t extra=row_bytes-scratch_budget;
+            if(extra>runtime().available())cached_samples.release_memory(extra-runtime().available());
+            extra_scratch=runtime().reserve(extra);scratch_budget=row_bytes;
+        }
+        unsigned concurrency=unsigned(std::min<uint64_t>(runtime().threads(),std::max<uint64_t>(1,scratch_budget/std::max<uint64_t>(1,row_bytes))));
+        unsigned rows=unsigned(std::clamp<uint64_t>(scratch_budget/concurrency/std::max<uint64_t>(1,row_bytes),1,16));
+        runtime().parallel((R.h+rows-1)/rows,[&](size_t part){
+            unsigned first=unsigned(part)*rows,last=std::min(unsigned(R.h),first+rows);
+            size_t stripe=size_t(last-first)*R.w;
+            std::vector<uint8_t> block(store.size()*4*stripe*bytes);
+            for(size_t frame=0;frame<store.size();++frame)for(unsigned k=0;k<4;++k)
+                cached_samples.read(store[frame],(k*plane+size_t(first)*R.w)*bytes,
+                                    block.data()+(frame*4*stripe+k*stripe)*bytes,stripe*bytes);
+            std::vector<float> values(store.size());
+            for(size_t i=0;i<stripe;++i){
+                size_t o=size_t(first)*R.w+i;if(R.clip[o])continue;
+                for(unsigned k=0;k<4;++k){
+                    size_t n=0;
+                    for(size_t frame=0;frame<store.size();++frame){
+                        auto *ptr=block.data()+(frame*4*stripe+k*stripe+i)*bytes;
+                        if(precise){float value;std::memcpy(&value,ptr,4);if(std::isfinite(value))values[n++]=value;}
+                        else {uint16_t value;std::memcpy(&value,ptr,2);if(value)values[n++]=decode_sample(value);}
                     }
-                    wsum.d[o] = 1;
+                    if(trimmed)acc.p[k].d[o]=trimmed_mean(values.data(),values.data()+n,opt.trim_percent);
+                    else {auto mid=values.begin()+long(n/2);std::nth_element(values.begin(),mid,values.begin()+long(n));
+                          acc.p[k].d[o]=(n&1)?*mid:.5f*(*mid+*std::max_element(values.begin(),mid));}
                 }
-        });
+                wsum.d[o]=1;
+            }
+        },concurrency);
+        if(cached_samples.spilled())log("aligned cache: "+std::to_string(cached_samples.spilled()>>20)+" MiB in temporary storage");
     }
 
     // output: scaled 16-bit mosaic
@@ -1004,6 +1011,7 @@ struct RegisteredPhoto {
     RawPhoto photo;
     ProjectiveMap forward, backward;
     float exposure = 1;
+    size_t cache_id=SIZE_MAX;
 };
 
 
@@ -1054,7 +1062,7 @@ constexpr float sr_radius_squared = sr_radius * sr_radius;
 using Kernel = std::array<float, 1025>;
 
 void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width, int height,
-                     int scale, const Kernel &kernel, std::vector<Moments> &moment) {
+                     int scale, const Kernel &kernel, std::vector<Moments> &moment,const ArrayStore &cache) {
     const auto &p = frame.photo;
     Position low{double(p.width), double(p.height)}, high{-1, -1};
     for (int x : {left - 2, left + width / scale + 2})
@@ -1066,6 +1074,14 @@ void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width,
     const int first_x = std::max(0, int(std::floor(low.x))), first_y = std::max(0, int(std::floor(low.y)));
     const int last_x = std::min(int(p.width) - 1, int(std::ceil(high.x)));
     const int last_y = std::min(int(p.height) - 1, int(std::ceil(high.y)));
+    if(first_x>last_x||first_y>last_y)return;
+    const unsigned region_width=unsigned(last_x-first_x+1),region_height=unsigned(last_y-first_y+1);
+    std::vector<uint16_t> source;
+    if(frame.cache_id!=SIZE_MAX){
+        source.resize(size_t(region_width)*region_height);
+        for(unsigned row=0;row<region_height;++row)cache.read(frame.cache_id,(uint64_t(first_y+row)*p.width+first_x)*2,
+            source.data()+size_t(row)*region_width,size_t(region_width)*2);
+    }
     const float radius = scale * sr_radius;
     const float pitch = 1.0f / scale;
     for (int y = first_y; y <= last_y; ++y)
@@ -1074,7 +1090,7 @@ void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width,
             float cx = float(scale * (pos.x - left + .5) - .5);
             float cy = float(scale * (pos.y - top + .5) - .5);
             const unsigned color = p.info.cfa[(y & 1) * 2 + (x & 1)];
-            const float value = (float(p.pixels[size_t(y) * p.width + x]) - p.black - p.info.black_delta[(y & 1) * 2 + (x & 1)]) * frame.exposure;
+            const float value = (float(frame.cache_id==SIZE_MAX?p.pixels[size_t(y)*p.width+x]:source[size_t(y-first_y)*region_width+x-first_x]) - p.black - p.info.black_delta[(y & 1) * 2 + (x & 1)]) * frame.exposure;
             const int y0 = std::max(0, int(std::ceil(cy - radius))), y1 = std::min(height - 1, int(std::floor(cy + radius)));
             const int x0 = std::max(0, int(std::ceil(cx - radius))), x1 = std::min(width - 1, int(std::floor(cx + radius)));
             for (int oy = y0; oy <= y1; ++oy)
@@ -1089,9 +1105,8 @@ void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width,
 }
 
 void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const Crop &crop, const FrameInfo &info,
-                    SrImage &out, float sigma, int scale) {
-    // Bound the output tile to 256 pixels and keep tile origins on whole Bayer quads.
-    const int tile = (128 / scale) * 2;
+                    SrImage &out, float sigma, int scale,int tile,unsigned concurrency,const ArrayStore &cache) {
+    StageTimer timer(Stage::Reconstruct);
     const int out_tile = scale * tile;
     const int width = int(out.width), height = int(out.height);
     const int columns = (int(crop.width) + tile - 1) / tile, rows = (int(crop.height) + tile - 1) / tile;
@@ -1103,17 +1118,18 @@ void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const Crop &crop
         double d2 = double(i) * sr_radius_squared / double(kernel.size() - 1);
         kernel[i] = float(std::exp(-d2 / (2 * variance)));
     }
-    parallel_for(columns * rows, [&](int first, int last) {
-        for (int index = first; index < last; ++index) {
+    runtime().parallel(size_t(columns)*rows,[&](size_t job) {
+            int index=int(job);
             const int x0 = out_tile * (index % columns), y0 = out_tile * (index / columns);
             const int w = std::min(width - x0, out_tile), h = std::min(height - y0, out_tile);
             const int left = int(crop.x) + x0 / scale, top = int(crop.y) + y0 / scale;
             std::vector<Moments> moment(size_t(w) * h * 3);
             for (const auto &frame : frames)
-                accumulate_tile(frame, left, top, w, h, scale, kernel, moment);
+                accumulate_tile(frame, left, top, w, h, scale, kernel, moment,cache);
+            std::vector<uint16_t> output(out.storage?size_t(w)*h*(out.linear?3:1):0);
             for (int y = 0; y < h; ++y)
                 for (int x = 0; x < w; ++x) {
-                    const size_t i = size_t(y) * w + x, o = size_t(y + y0) * out.width + x + x0;
+                    const size_t i = size_t(y) * w + x, o = out.storage?i:size_t(y + y0) * out.width + x + x0;
                     const unsigned site = info.cfa[(y & 1) * 2 + (x & 1)];
                     for (unsigned c = 0; c < 3; ++c) {
                         if (!out.linear && c != site) continue;
@@ -1126,11 +1142,11 @@ void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const Crop &crop
                             v = w * v + (1 - w) * base;
                         }
                         uint16_t packed = uint16_t(std::lround(std::clamp((v + ref.black) * code_scale, 0.0f, float(out.white))));
-                        out.pixels[out.linear ? 3 * o + c : o] = packed;
+                        (out.storage?output:out.pixels)[out.linear ? 3 * o + c : o] = packed;
                     }
                 }
-        }
-    });
+            if(out.storage)out.storage->put(unsigned(x0),unsigned(y0),unsigned(w),unsigned(h),output.data());
+    },concurrency);
 }
 
 } // namespace
@@ -1159,7 +1175,17 @@ bool superresolve(const ReadPhoto &read, const std::vector<size_t> &selected, si
     if (uint64_t(crop.width) * crop.height > (UINT32_MAX - (1u << 20)) / output_bytes_per_input) {
         err = "output exceeds the DNG writer's 32-bit TIFF limit; use a smaller crop or scale"; return false;
     }
-    g_threads = std::max(1u, std::thread::hardware_concurrency());
+    const uint64_t sensor_pixels=uint64_t(ref.width)*ref.height;
+    auto working=runtime().reserve(sensor_pixels*14+(16<<20));
+    auto decoding=runtime().reserve(sensor_pixels*32);
+    // Small crops need more jobs; large images use cache-friendly output tiles.
+    int target=std::min(uint64_t(crop.width)*opt.scale,uint64_t(crop.height)*opt.scale)<=512?32:128;
+    int tile=std::max(2,(std::clamp(target,32,128)/int(opt.scale)/2)*2);
+    int out_tile=tile*int(opt.scale);
+    uint64_t scratch=uint64_t(out_tile)*out_tile*128+(1<<20);
+    unsigned concurrency=unsigned(std::min<uint64_t>(runtime().threads(),std::max<uint64_t>(1,runtime().available()/4/scratch)));
+    auto reconstruction=runtime().reserve(scratch*concurrency);
+    auto cache=std::make_unique<ArrayStore>();
     auto movie = ref.movie;
     FrameInfo info = ref.info;
     if (cropped) crop_metadata(movie,info,crop);
@@ -1186,16 +1212,18 @@ bool superresolve(const ReadPhoto &read, const std::vector<size_t> &selected, si
         auto reference_controls = control_image(std::move(guide));
         auto points = control_points(reference_controls.fine);
 
-        for (size_t index : selected) {
-            if (index == reference) continue;
+        std::vector<size_t> pending;for(size_t index:selected)if(index!=reference)pending.push_back(index);
+        ReadQueue reader(read,pending,sensor_pixels*32);
+        for (size_t index : pending) {
             RawPhoto raw;
-            if (!read(index, raw, err)) return false;
+            if (!reader.read(index, raw, err)) return false;
             if (!compatible_photos(base, raw)) {
                 err = "frame " + std::to_string(index) + ": incompatible raw geometry, CFA or levels";
                 return false;
             }
             const float exposure = float(exposure_scale(base.info, raw.info)) *
                                    float(base.white - base.black) / float(raw.white - raw.black);
+            StageTimer alignment(Stage::Align);
             Img g = grey(split(raw.pixels, raw.width, raw.height, float(raw.black), exposure, raw.white, raw.info.black_delta));
             auto prior = align(reference_pyramid, pyramid(g), 32);
             auto control = control_image(std::move(g));
@@ -1206,17 +1234,25 @@ bool superresolve(const ReadPhoto &read, const std::vector<size_t> &selected, si
             }
             auto residual = cropped ? refine_crop(reference_controls.fine, control.fine, fit.model, crop) : Position{};
             auto warp = sensor_map(fit.model, residual);
-            frames.push_back({std::move(raw), warp, warp.inverse(), exposure});
+            size_t cached=cache->put(std::move(raw.pixels));raw.pixels.clear();
+            raw.movie.profile.clear(); // reconstruction uses the reference calibration
+            frames.push_back({std::move(raw), warp, warp.inverse(), exposure,cached});
             log("frame " + std::to_string(index) + ": " + std::to_string(fit.inliers) + "/" +
                 std::to_string(fit.matched) + " control points");
         }
     }
+    decoding=MemoryLease{};
     const unsigned code_scale = 65535 / base.white;
     SrImage out{opt.scale * crop.width, opt.scale * crop.height, code_scale * base.black,
-                code_scale * base.white, opt.linear, {}};
-    out.pixels.resize(size_t(out.width) * out.height * (opt.linear ? 3 : 1));
-    reconstruct_sr(frames, crop, info, out, opt.kernel_sigma, int(opt.scale));
-    frames.clear();
+                code_scale * base.white, opt.linear, {},{}};
+    size_t sample_count=size_t(out.width)*out.height*(opt.linear?3:1);
+    auto output_memory=runtime().reserve(uint64_t(sample_count)*2,false);
+    if(output_memory)out.pixels.resize(sample_count);
+    else out.storage=std::make_shared<TiledImage>(out.width,out.height,opt.linear?3:1,unsigned(out_tile));
+    reconstruct_sr(frames,crop,info,out,opt.kernel_sigma,int(opt.scale),tile,concurrency,*cache);
+    if(cache->spilled())log("raw cache: "+std::to_string(cache->spilled()>>20)+" MiB in temporary storage");
+    if(out.storage&&out.storage->spilled())log("output cache: "+std::to_string(out.storage->spilled()>>20)+" MiB in temporary storage");
+    frames.clear();cache.reset();working=MemoryLease{};reconstruction=MemoryLease{};
     return save(selected.size(), out, crop_movie(opt.scale), info);
 }
 

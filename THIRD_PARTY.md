@@ -5,6 +5,9 @@ The application is GPL-2.0-or-later; see [COPYING](COPYING).
 - `third_party/nikon-he-public`: public HE decoder from LibRaw PR #826 (Dmitri Sotnikov),
   LGPL-2.1 or CDDL. Bundled LICENSE.LGPL and LICENSE.CDDL contain the terms; source
   receipts record provenance. Local subband fixes are documented in development notes.
+  Local concurrency changes make layout state thread-local and prediction-table
+  initialization thread-safe; see
+  [`public-he-concurrency.patch`](third_party/nikon-he-public/public-he-concurrency.patch).
 - `src/he_decode.cpp`: GPL-2.0-or-later bridge adapted from
   [nefcomp](https://github.com/missingno7/nefcomp) and
   [WonderLantern z8-qemu](https://github.com/WonderLantern/z8-qemu).

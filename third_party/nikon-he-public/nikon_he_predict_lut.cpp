@@ -1,3 +1,4 @@
+/* nevtoraw modification, 2026-11-23: thread-safe lookup initialization. */
 /* -*- C++ -*-
  * File: nikon_he_predict_lut.cpp
  * Copyright (C) 2026 Dmitri Sotnikov
@@ -29,17 +30,13 @@ it under the terms of the one of two licenses as you choose:
 
 #include "nikon_he_predict_lut.h"
 #include <algorithm>
+#include <array>
 
 namespace nikon_he {
 
 const uint8_t* build_prediction_lookup_table() {
-    static uint8_t lut[kPredictionLutSize];
-    static bool built = false;
-
-    if (built) {
-        return lut;
-    }
-
+    static const auto lut = [] {
+    std::array<uint8_t,kPredictionLutSize> lut{};
     for (int gtli = 0; gtli < 16; ++gtli) {
         for (int previous_gcli = 0; previous_gcli < 16; ++previous_gcli) {
             int m_top = std::max(previous_gcli, gtli);
@@ -76,8 +73,9 @@ const uint8_t* build_prediction_lookup_table() {
         }
     }
 
-    built = true;
     return lut;
+    }();
+    return lut.data();
 }
 
 }  // namespace nikon_he

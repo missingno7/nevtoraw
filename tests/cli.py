@@ -32,6 +32,13 @@ def tags(path):
             struct.iter_unpack("<HHI4s", data[offset + 2:offset + 2 + 12 * count])}
 
 
+def integers(path, tag):
+    kind, count, pointer = tags(path)[tag]
+    width, fmt = {3: (2, "H"), 4: (4, "I")}[kind]
+    payload = pointer[:count*width] if count*width <= 4 else path.read_bytes()[struct.unpack("<I", pointer)[0]:][:count*width]
+    return struct.unpack("<"+fmt*count, payload)
+
+
 version = run("--version").strip()
 assert version == "nevtoraw 0.2.0", version
 catalog = run("cameras")
@@ -104,8 +111,8 @@ if shutil.which("dcraw"):
     raw = subprocess.check_output(["dcraw", "-D", "-4", "-j", "-t", "0", "-c", str(small_file)])
     magic, dimensions, white, samples = raw.split(b"\n", 3)
     assert (magic, dimensions, white) == (b"P5", b"96 80", b"65535")
-    offset = struct.unpack("<I", tags(source)[273][2])[0]
-    stored = source.read_bytes()[offset:offset + 270*258*2]
+    contents = source.read_bytes()
+    stored = b"".join(contents[offset:offset+count] for offset, count in zip(integers(source, 273), integers(source, 279)))
     expected = b"".join(stored[((y+5)*270+3)*2:((y+5)*270+99)*2] for y in range(80))
     decoded = array.array("H")
     decoded.frombytes(samples)
@@ -157,6 +164,26 @@ for options in (["--trim-percent", "20"], ["--no-align", "--align", "homography"
 for command in ("dng", "stack", "sr"):
     run(command, source, "--crop", "0,0,1,2", code=2)
     run(command, source, "--crop", "999999,0,2,2", code=1)
+
+# Execution controls are shared, and cache backing must not alter output.
+temporary = root / "scratch"
+temporary.mkdir()
+for command in ("dng", "stack", "sr"):
+    options = ["--no-align"] if command == "stack" else ["--scale", "4"] if command == "sr" else []
+    expected = root / (command + "-resident")
+    actual = root / (command + "-bounded")
+    run(command, source, *options, "--threads", "1", "--memory-limit", "256M", "-c", "none", "-o", expected)
+    text = run(command, source, *options, "--threads", "4", "--memory-limit", "24MiB", "--temp-dir", temporary, "-c", "none", "-o", actual)
+    assert next(expected.glob("*.dng")).read_bytes() == next(actual.glob("*.dng")).read_bytes(), command
+    if command == "sr":
+        assert "output cache:" in text and "temporary storage" in text
+    assert "RAM budget" in text and "stage work time" in text
+    assert not list(temporary.iterdir())
+    assert "memory budget too small" in run(command, source, "--memory-limit", "1K", code=1)
+for options in (["--threads", "0"], ["--threads", "1025"], ["--threads", "-1"],
+                ["--memory-limit", "0"], ["--memory-limit", "1.5G"], ["--memory-limit", "1Z"]):
+    run("dng", source, *options, code=2)
+run("dng", source, "--temp-dir", root / "missing-directory", code=1)
 
 # Folder outputs stay out of subsequent source scans.
 run("dng", burst)

@@ -89,6 +89,11 @@ void Ifd::add_offsets(uint16_t off_tag, uint16_t cnt_tag, const std::vector<int>
     for (int id : ids) cnt.push_back(uint32_t(blobs[size_t(id)].size()));
     add_long(cnt_tag, cnt);
 }
+void Ifd::add_offsets(uint16_t off_tag,uint16_t cnt_tag,const std::vector<uint32_t> &sizes){
+    Entry e;e.tag=off_tag;e.type=LONG;e.count=uint32_t(sizes.size());e.data.assign(4*e.count,0);
+    for(size_t i=0;i<sizes.size();++i)e.blobs.push_back(int(i));
+    entries.push_back(std::move(e));add_long(cnt_tag,sizes);
+}
 
 namespace {
 struct Placed { Ifd *ifd; uint32_t off; };
@@ -105,7 +110,7 @@ size_t ifd_size(const Ifd &ifd) {
 }
 } // namespace
 
-std::vector<uint8_t> build(Ifd &ifd0, const std::vector<std::vector<uint8_t>> &blobs) {
+Layout layout(Ifd &ifd0,const std::vector<uint32_t> &sizes) {
     std::vector<Ifd *> order;
     collect(&ifd0, order);
     for (auto *i : order)
@@ -113,10 +118,10 @@ std::vector<uint8_t> build(Ifd &ifd0, const std::vector<std::vector<uint8_t>> &b
     std::vector<uint32_t> ifd_off(order.size());
     uint64_t pos = 8;
     for (size_t k = 0; k < order.size(); k++) { ifd_off[k] = uint32_t(pos); pos += ifd_size(*order[k]); }
-    std::vector<uint32_t> blob_off(blobs.size());
-    for (size_t k = 0; k < blobs.size(); k++) {
+    std::vector<uint32_t> blob_off(sizes.size());
+    for (size_t k = 0; k < sizes.size(); k++) {
         pos = (pos + 15) & ~uint64_t(15);
-        blob_off[k] = uint32_t(pos); pos += blobs[k].size();
+        blob_off[k] = uint32_t(pos); pos += sizes[k];
     }
     if (pos > 0xffffffffull) throw std::runtime_error("TIFF larger than 4 GB");
     auto index_of = [&](const Ifd *p) {
@@ -130,7 +135,6 @@ std::vector<uint8_t> build(Ifd &ifd0, const std::vector<std::vector<uint8_t>> &b
             for (size_t s = 0; s < e.blobs.size(); s++) set32(e.data, 4 * s, blob_off[size_t(e.blobs[s])]);
         }
     std::vector<uint8_t> out;
-    out.reserve(size_t(pos));
     put16(out, 0x4949);  // "II"
     put16(out, 42);
     put32(out, 8);
@@ -154,10 +158,12 @@ std::vector<uint8_t> build(Ifd &ifd0, const std::vector<std::vector<uint8_t>> &b
         put32(out, 0);  // no next IFD (sub-IFDs only)
         out.insert(out.end(), tail.begin(), tail.end());
     }
-    for (size_t k = 0; k < blobs.size(); k++) {
-        out.resize(blob_off[k], 0);
-        out.insert(out.end(), blobs[k].begin(), blobs[k].end());
-    }
+    return {std::move(out),std::move(blob_off),pos};
+}
+std::vector<uint8_t> build(Ifd &ifd0,const std::vector<std::vector<uint8_t>> &blobs){
+    std::vector<uint32_t> sizes;for(const auto &blob:blobs)sizes.push_back(uint32_t(blob.size()));
+    auto placed=layout(ifd0,sizes);auto out=std::move(placed.header);out.reserve(size_t(placed.size));
+    for(size_t i=0;i<blobs.size();++i){out.resize(placed.offsets[i],0);out.insert(out.end(),blobs[i].begin(),blobs[i].end());}
     return out;
 }
 

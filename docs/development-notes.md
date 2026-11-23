@@ -223,3 +223,26 @@ nevtoraw sr clip.NEV --count 256 --scale 4 --kernel-sigma 0.10 -o out/4x
 Omit it to reconstruct the whole image. LinearRaw stores three 16-bit samples per
 pixel. Filenames include the scale, output format, and count, for example
 `DSC_8038_sr2x_linear_16.dng`.
+
+## Shared execution checks (2026-11-23)
+
+Local warm-input checks used DSC_8038.NEV (3852×2168), frames 0–63, with a
+128×128 sensor crop at (1600,900). SR used the default 2× LinearRaw/sigma 0.30;
+stack used trimmed mean. Single-run wall times and sampled peak working sets:
+
+| Operation | Before shared runtime | Automatic runtime | Runtime with 512 MiB budget |
+| --- | --- | --- | --- |
+| SR, 64 frames | 13.20 s / 1178 MB | 3.01 s / 1546 MB | 15.00 s / 241 MB |
+| Trimmed stack, 64 frames | 14.84 s / 1335 MB | 5.18 s / 1560 MB | 16.94 s / 467 MB |
+
+The automatic runs used 32 execution slots and could overlap decoding. The
+constrained runs reduced concurrency and spilled caches to temporary storage.
+These are illustrative local measurements, not a speed guarantee. MB here are
+decimal; the configured budget uses binary MiB. Reserved-memory estimates and
+observed process working set measure different things.
+
+Automatic and constrained runs produced identical DNG bytes. The new trimmed
+stack's sample values matched the previous executable exactly. The SR crop had
+126 of 196608 samples differ by one 16-bit output level after changing tile
+boundaries, with no larger differences. Synthetic checks also compare resident
+and disk-backed output, worker counts, scratch cleanup, and exception handling.

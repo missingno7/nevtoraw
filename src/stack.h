@@ -27,7 +27,6 @@ struct StackOptions {
     unsigned trim_percent = 20; // percentage removed from each tail in TrimmedMean
     StackAlignment alignment = StackAlignment::Homography;
     unsigned tile = 32;          // tile size in Bayer-plane pixels (= 2 sensor px)
-    unsigned threads = 0;
     float z_lo = 3.0f, z_hi = 5.0f;  // robust weight: 1 below z_lo, 0 above z_hi
 };
 

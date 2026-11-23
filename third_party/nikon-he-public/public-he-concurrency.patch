@@ -1,0 +1,34 @@
+Apply with git apply --unidiff-zero.
+
+diff --git a/third_party/nikon-he-public/nikon_he_predict_lut.cpp b/third_party/nikon-he-public/nikon_he_predict_lut.cpp
+index 241b5dd..a7f8e04 100644
+--- a/third_party/nikon-he-public/nikon_he_predict_lut.cpp
++++ b/third_party/nikon-he-public/nikon_he_predict_lut.cpp
+@@ -0,0 +1 @@
++/* nevtoraw modification, 2026-11-23: thread-safe lookup initialization. */
+@@ -31,0 +33 @@ it under the terms of the one of two licenses as you choose:
++#include <array>
+@@ -36,7 +38,2 @@ const uint8_t* build_prediction_lookup_table() {
+-    static uint8_t lut[kPredictionLutSize];
+-    static bool built = false;
+-
+-    if (built) {
+-        return lut;
+-    }
+-
++    static const auto lut = [] {
++    std::array<uint8_t,kPredictionLutSize> lut{};
+@@ -79 +75,0 @@ const uint8_t* build_prediction_lookup_table() {
+-    built = true;
+@@ -80,0 +77,2 @@ const uint8_t* build_prediction_lookup_table() {
++    }();
++    return lut.data();
+diff --git a/third_party/nikon-he-public/nikon_he_subband_config.cpp b/third_party/nikon-he-public/nikon_he_subband_config.cpp
+index 2af507a..31ca569 100644
+--- a/third_party/nikon-he-public/nikon_he_subband_config.cpp
++++ b/third_party/nikon-he-public/nikon_he_subband_config.cpp
+@@ -5,0 +6 @@
++/* nevtoraw modification, 2026-11-23: thread-local mutable layout state. */
+@@ -138 +139 @@ void compute_subband_layout(int half_pass_W, SubbandConfig out[26]) {
+-    static LayoutInfo layout_info;
++    static thread_local LayoutInfo layout_info;

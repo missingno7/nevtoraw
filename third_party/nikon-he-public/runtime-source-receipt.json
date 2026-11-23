@@ -39,7 +39,8 @@
   },
   "modifications": [
     "public-he-width-tail-dpb-evaluation.patch",
-    "public-he-runtime-safety.patch"
+    "public-he-runtime-safety.patch",
+    "public-he-concurrency.patch"
   ],
   "files": {
     "LICENSE.CDDL": "0e3098d2d54a12434715f6679ea408d57da5e8d613c385c58ecc6fe5d30cc81f",
@@ -71,9 +72,9 @@
     "nikon_he_precinct_header.h": "b8b6e8ace50ec4866088e3b3d0d1d1acda576fd843988b169d4fa5fd975a47c2",
     "nikon_he_predecessor.cpp": "f8ba0570e4aed2f5ec1e5ba508cffdebc637c8f4d0561bc40b5d2a100a29fa4f",
     "nikon_he_predecessor.h": "2c5da18177278b7dbd4567c98105a331eae369c221ab6d415343f42aa5091923",
-    "nikon_he_predict_lut.cpp": "f5e74be8ee35ae1fbcb55f68bc4ea156d16e41c6751973e7b8ae158a99a0be2f",
+    "nikon_he_predict_lut.cpp": "2c813403b9075804660311d3072f35c37e30df3f3a09d397b57b9b432d1402da",
     "nikon_he_predict_lut.h": "4d86226f480f2ff2da4ffb2072d18a8b924556c95ed5b685a6112a6167ac94c2",
-    "nikon_he_subband_config.cpp": "a261341fbe62e2feefb538b17a81e089646a7c8550d195ff5120cc7475f28f48",
+    "nikon_he_subband_config.cpp": "f2e312a4cdf43d179e4f31d24dee10591aac98188e133590e37cebd9c28f84f7",
     "nikon_he_subband_config.h": "18771de772d1c7883dcf93a5b6f92027dfa62f1b232b7238fa437225a8dbab7e",
     "nikon_he_tile.cpp": "76d7c624e629b1c490c0dc4221a8b9dd10c91e5b4624c93e3672db929ae1de1e",
     "nikon_he_tile.h": "27d84a0f547f0d65bd8a438baf88102af67949caa1ffa2581c3a2f20f9e1c4f7",
@@ -109,5 +110,6 @@
     "nikon_he_tile.cpp": "04490431125453658b5c2cad1a3c5dc02900aacddb854c6f14745e370db4cbd2"
   },
   "license_choice_note": "Upstream grants LGPL version2.1 or CDDL1.0. This package selects version2.1; no additional later-version grant is inferred.",
-  "packaging_line_endings": "LF; source receipt JSON whitespace normalized without changing its contents"
+  "packaging_line_endings": "LF; source receipt JSON whitespace normalized without changing its contents",
+  "concurrency_note": "nevtoraw 2026-11-23: mutable layout is thread-local; prediction table uses thread-safe constant initialization. Active picture header and computed GTLI rows were already thread-local."
 }

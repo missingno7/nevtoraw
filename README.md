@@ -98,6 +98,14 @@ output directory. DNG conversion adds `_converted` to the filename. Generated
 outputs can be replaced by a rerun; source files are protected from replacement.
 Failed writes leave existing outputs intact.
 
+Execution settings are automatic across conversion, stacking, and SR. A shared
+worker pool overlaps decoding with processing; the default RAM budget is 70% of
+currently available memory. Large frame/output caches spill to temporary storage.
+Use `--memory-limit 8G` to constrain RAM, `--threads 8` to limit workers, or
+`--temp-dir D:\scratch` to select scratch storage. The program reports its budget
+and stage timings. See [execution and memory](docs/runtime.md) for working-memory
+minimums and cache behavior.
+
 Stacking preserves a Bayer mosaic and averages in linear raw space. SR reconstructs
 camera-native channels from aligned CFA samples. It applies no display tone curve
 or white balance to the sample values. Handheld movement can provide useful
