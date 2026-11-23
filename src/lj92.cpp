@@ -64,10 +64,9 @@ struct BitWriter {
 
 inline int ssss(int d) { int a = d < 0 ? -d : d, s = 0; while (a) { s++; a >>= 1; } return s; }
 
-} // namespace
-
-std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits) {
-    const unsigned cw = w / 2;  // JPEG width with 2 components
+std::vector<uint8_t> encode_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits,
+                                 unsigned components) {
+    const unsigned cw = w / components;
     // differences
     std::vector<int32_t> diff(size_t(w) * h);
     uint32_t freq[17] = {};
@@ -75,7 +74,7 @@ std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h,
     for (unsigned y = 0; y < h; y++) {
         const uint16_t *r = px + y * stride, *up = y ? px + (y - 1) * stride : nullptr;
         for (unsigned x = 0; x < w; x++) {
-            int pred = x >= 2 ? r[x - 2] : (y ? up[x] : init);
+            int pred = x >= components ? r[x - components] : (y ? up[x] : init);
             int d = int(r[x]) - pred;
             // modulo 2^16 into [-32768, 32767]
             d = int16_t(uint16_t(d));
@@ -104,11 +103,12 @@ std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h,
     for (int l = 1; l <= 16; l++) out.push_back(hbits[l]);
     for (int k = 0; k < nvals; k++) out.push_back(hvals[k]);
     // SOF3
-    m16(0xffc3); m16(8 + 3 * 2); out.push_back(uint8_t(bits)); m16(uint16_t(h)); m16(uint16_t(cw)); out.push_back(2);
-    for (int c = 0; c < 2; c++) { out.push_back(uint8_t(c + 1)); out.push_back(0x11); out.push_back(0); }
+    m16(0xffc3); m16(uint16_t(8 + 3 * components)); out.push_back(uint8_t(bits));
+    m16(uint16_t(h)); m16(uint16_t(cw)); out.push_back(uint8_t(components));
+    for (unsigned c = 0; c < components; c++) { out.push_back(uint8_t(c + 1)); out.push_back(0x11); out.push_back(0); }
     // SOS: predictor 1
-    m16(0xffda); m16(6 + 2 * 2); out.push_back(2);
-    for (int c = 0; c < 2; c++) { out.push_back(uint8_t(c + 1)); out.push_back(0x00); }
+    m16(0xffda); m16(uint16_t(6 + 2 * components)); out.push_back(uint8_t(components));
+    for (unsigned c = 0; c < components; c++) { out.push_back(uint8_t(c + 1)); out.push_back(0x00); }
     out.push_back(1); out.push_back(0); out.push_back(0);
     BitWriter bw{out};
     for (size_t i = 0; i < diff.size(); i++) {
@@ -119,6 +119,16 @@ std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h,
     bw.flush();
     m16(0xffd9);
     return out;
+}
+
+} // namespace
+
+std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits) {
+    return encode_tile(px, w, h, stride, bits, 2);
+}
+
+std::vector<uint8_t> encode_rgb_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits) {
+    return encode_tile(px, 3 * w, h, stride, bits, 3);
 }
 
 } // namespace lj92

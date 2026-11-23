@@ -10,5 +10,6 @@ namespace lj92 {
 // as w/2 x h with two interleaved components, as Adobe does for CFA data, so the
 // left predictor sees the same colour. w must be even.
 std::vector<uint8_t> encode_cfa_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits);
+std::vector<uint8_t> encode_rgb_tile(const uint16_t *px, unsigned w, unsigned h, size_t stride, unsigned bits);
 
 } // namespace lj92

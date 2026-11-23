@@ -4,7 +4,7 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 LDFLAGS ?= -static
 HE_PUB := third_party/nikon-he-public
 
-SRCS := src/main.cpp src/nev.cpp src/meta.cpp src/dng.cpp src/tiffw.cpp src/lj92.cpp src/he_decode.cpp src/stack.cpp
+SRCS := src/main.cpp src/nev.cpp src/nef.cpp src/nikon_lossless.cpp src/meta.cpp src/dng.cpp src/tiffw.cpp src/lj92.cpp src/he_decode.cpp src/stack.cpp
 PUB_SRCS := $(wildcard $(HE_PUB)/*.cpp)
 
 all: nevtoraw.exe

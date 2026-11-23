@@ -70,14 +70,15 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
                                const FrameInfo &fi, size_t frame_index, const std::string &original_name,
                                const DngOptions &opt) {
     using namespace tiffw;
+    const unsigned channels = opt.linear_rgb ? 3 : 1;
     std::vector<std::vector<uint8_t>> blobs;
     Ifd raw;
     raw.add_long(0x00fe, {0});
     raw.add_long(0x0100, {W});
     raw.add_long(0x0101, {H});
-    raw.add_short(0x0102, {16});
-    raw.add_short(0x0106, {32803});
-    raw.add_short(0x0115, {1});
+    raw.add_short(0x0102, std::vector<uint16_t>(channels, 16));
+    raw.add_short(0x0106, {uint16_t(opt.linear_rgb ? 34892 : 32803)});
+    raw.add_short(0x0115, {uint16_t(channels)});
     raw.add_short(0x011c, {1});
     if (opt.compression == DngCompression::None) {
         raw.add_short(0x0103, {1});
@@ -93,19 +94,22 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         std::atomic<size_t> next{0};
         unsigned nt = opt.threads ? opt.threads : std::max(1u, std::thread::hardware_concurrency());
         auto work = [&]() {
-            std::vector<uint16_t> buf(size_t(T) * T);
+            std::vector<uint16_t> buf(size_t(T) * T * channels);
             for (size_t k; (k = next++) < tiles.size();) {
                 unsigned x0 = unsigned(k % tx) * T, y0 = unsigned(k / tx) * T;
                 // pad by repeating the last same-colour column/row
                 for (unsigned y = 0; y < T; y++) {
-                    unsigned sy = y0 + y; if (sy >= H) sy = H - 2 + ((sy - H) & 1);
-                    const uint16_t *src = px.data() + size_t(sy) * W;
+                    unsigned sy = y0 + y;
+                    if (sy >= H) sy = opt.linear_rgb ? H - 1 : H - 2 + ((sy - H) & 1);
+                    const uint16_t *src = px.data() + size_t(sy) * W * channels;
                     for (unsigned x = 0; x < T; x++) {
-                        unsigned sx = x0 + x; if (sx >= W) sx = W - 2 + ((sx - W) & 1);
-                        buf[size_t(y) * T + x] = src[sx];
+                        unsigned sx = x0 + x;
+                        if (sx >= W) sx = opt.linear_rgb ? W - 1 : W - 2 + ((sx - W) & 1);
+                        std::copy_n(src + sx * channels, channels, buf.data() + (size_t(y) * T + x) * channels);
                     }
                 }
-                tiles[k] = lj92::encode_cfa_tile(buf.data(), T, T, T, 16);
+                tiles[k] = opt.linear_rgb ? lj92::encode_rgb_tile(buf.data(), T, T, 3 * T, 16)
+                                          : lj92::encode_cfa_tile(buf.data(), T, T, T, 16);
             }
         };
         std::vector<std::thread> th;
@@ -118,17 +122,19 @@ std::vector<uint8_t> build_dng(const std::vector<uint16_t> &px, unsigned W, unsi
         raw.add_long(0x0143, {T});
         raw.add_offsets(0x0144, 0x0145, ids, blobs);
     }
-    raw.add_short(0x828d, {2, 2});
-    raw.add_bytes(0x828e, BYTE, {uint8_t(fi.cfa[0]), uint8_t(fi.cfa[1]), uint8_t(fi.cfa[2]), uint8_t(fi.cfa[3])});
-    raw.add_bytes(0xc616, BYTE, {0, 1, 2});
-    raw.add_short(0xc617, {1});
-    raw.add_long(0xc61a, {opt.black_level});
-    raw.add_long(0xc61d, {opt.white_level});
+    if (!opt.linear_rgb) {
+        raw.add_short(0x828d, {2, 2});
+        raw.add_bytes(0x828e, BYTE, {uint8_t(fi.cfa[0]), uint8_t(fi.cfa[1]), uint8_t(fi.cfa[2]), uint8_t(fi.cfa[3])});
+        raw.add_bytes(0xc616, BYTE, {0, 1, 2});
+        raw.add_short(0xc617, {1});
+        raw.add_long(0xc62d, {0});  // BayerGreenSplit
+    }
+    raw.add_long(0xc61a, std::vector<uint32_t>(channels, opt.black_level));
+    raw.add_long(0xc61d, std::vector<uint32_t>(channels, opt.white_level));
     unsigned cw = mi.crop_w && mi.crop_w <= W ? mi.crop_w : W, ch = mi.crop_h && mi.crop_h <= H ? mi.crop_h : H;
     unsigned ox = ((W - cw) / 2) & ~1u, oy = ((H - ch) / 2) & ~1u;
     raw.add_rational(0xc61f, {{ox, 1}, {oy, 1}});
     raw.add_rational(0xc620, {{cw, 1}, {ch, 1}});
-    raw.add_long(0xc62d, {0});  // BayerGreenSplit
 
     // ---- IFD0: raw image + camera/profile tags (no preview)
     Ifd &ifd0 = raw;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "stack.h"
+#include "sr.h"
 
 #include "he_decode.h"
 #include "meta.h"
@@ -884,6 +885,348 @@ bool stack_frames(const File &f, const std::vector<size_t> &frames, size_t ref, 
             }
     });
     out.frames_used = used;
+    return true;
+}
+
+namespace {
+
+struct Position { double x = 0, y = 0; };
+
+struct ProjectiveMap {
+    double cx = 0, cy = 0, scale = 1;
+    std::array<double, 9> matrix{1, 0, 0, 0, 1, 0, 0, 0, 1};
+
+    Position at(double x, double y) const {
+        double u = (x - cx) / scale, v = (y - cy) / scale;
+        const auto &m = matrix;
+        double gain = scale / (m[6] * u + m[7] * v + m[8]);
+        return {cx + gain * (m[0] * u + m[1] * v + m[2]),
+                cy + gain * (m[3] * u + m[4] * v + m[5])};
+    }
+
+    ProjectiveMap inverse() const {
+        const auto &m = matrix;
+        return {cx, cy, scale, {
+             m[4]*m[8]-m[5]*m[7], m[2]*m[7]-m[1]*m[8], m[1]*m[5]-m[2]*m[4],
+             m[5]*m[6]-m[3]*m[8], m[0]*m[8]-m[2]*m[6], m[2]*m[3]-m[0]*m[5],
+             m[3]*m[7]-m[4]*m[6], m[1]*m[6]-m[0]*m[7], m[0]*m[4]-m[1]*m[3],
+        }};
+    }
+};
+
+ProjectiveMap sensor_map(const Homography &h, Position residual) {
+    const auto &a = h.a;
+    const double s = h.scale, u = residual.x / s, v = residual.y / s;
+    const double g = a[6] / s, k = a[7] / s;
+    // The alignment proxy treats the midpoint of each four-site quad as its pixel centre.
+    return {2 * h.cx + .5, 2 * h.cy + .5, 2 * s, {
+        1 + a[2]/s + u*g, a[3]/s + u*k, a[0]/s + u,
+        a[4]/s + v*g, 1 + a[5]/s + v*k, a[1]/s + v,
+        g, k, 1,
+    }};
+}
+
+Position refine_crop(const Img &reference, const Img &frame, const Homography &model, const SrCrop &crop) {
+    Position shift;
+    const int left = int(crop.x / 2), top = int(crop.y / 2);
+    const int right = int((crop.x + crop.width) / 2), bottom = int((crop.y + crop.height) / 2);
+    const int step = std::max(2, std::min(right - left, bottom - top) / 100);
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        double xx = 0, xy = 0, yy = 0, rx = 0, ry = 0;
+        for (int y = top; y < bottom; y += step)
+            for (int x = left; x < right; x += step) {
+                double dx, dy;
+                model.displacement(x, y, dx, dy);
+                double u = x + dx + shift.x, v = y + dy + shift.y;
+                int ix = int(std::floor(u)), iy = int(std::floor(v));
+                if (ix < 0 || iy < 0 || ix + 1 >= frame.w || iy + 1 >= frame.h) continue;
+                double fx = u - ix, fy = v - iy;
+                double a = frame.at(ix, iy), b = frame.at(ix + 1, iy);
+                double c = frame.at(ix, iy + 1), d = frame.at(ix + 1, iy + 1);
+                double upper = a + fx * (b - a), lower = c + fx * (d - c);
+                double gx = (1 - fy) * (b - a) + fy * (d - c), gy = lower - upper;
+                double e = reference.at(x, y) - (upper + fy * gy);
+                double w = 1 / std::max(1.0, std::abs(e) / 2);
+                xx += w * gx * gx; xy += w * gx * gy; yy += w * gy * gy;
+                rx += w * gx * e; ry += w * gy * e;
+            }
+        double det = xx * yy - xy * xy;
+        if (det < 1e-9) break;
+        double dx = (yy * rx - xy * ry) / det, dy = (xx * ry - xy * rx) / det;
+        shift.x += std::clamp(dx, -.75, .75);
+        shift.y += std::clamp(dy, -.75, .75);
+        if (std::hypot(dx, dy) < .005) break;
+    }
+    return shift;
+}
+
+struct RegisteredPhoto {
+    size_t index;
+    RawPhoto photo;
+    ProjectiveMap forward, backward;
+    float exposure = 1;
+};
+
+// Pick different sampling phases first so smaller subsets cover the Bayer period.
+void order_by_phase(std::vector<RegisteredPhoto> &frames, const SrCrop &crop) {
+    const double x = crop.x + .5 * crop.width, y = crop.y + .5 * crop.height;
+    auto distance = [](Position a, Position b) {
+        const double dx = std::remainder(a.x - b.x, 2), dy = std::remainder(a.y - b.y, 2);
+        return dx * dx + dy * dy;
+    };
+    std::vector<Position> phases;
+    for (const auto &f : frames) phases.push_back(f.forward.at(x, y));
+    std::vector<double> nearest(frames.size(), 8);
+    for (size_t i = 1; i < frames.size(); ++i) {
+        for (size_t j = i; j < frames.size(); ++j)
+            nearest[j] = std::min(nearest[j], distance(phases[i - 1], phases[j]));
+        size_t best = size_t(std::max_element(nearest.begin() + i, nearest.end()) - nearest.begin());
+        std::swap(frames[i], frames[best]);
+        std::swap(phases[i], phases[best]);
+        std::swap(nearest[i], nearest[best]);
+    }
+}
+
+struct Moments {
+    float sum = 0, x = 0, y = 0, xx = 0, xy = 0, yy = 0;
+    float value = 0, xv = 0, yv = 0;
+
+    void add(float w, float dx, float dy, float v) {
+        float wx = w * dx, wy = w * dy, wv = w * v;
+        sum += w; x += wx; y += wy;
+        xx += wx * dx; xy += wx * dy; yy += wy * dy;
+        value += wv; xv += wv * dx; yv += wv * dy;
+    }
+
+    float estimate() const {
+        const float dx = x / sum, dy = y / sum, mean = value / sum;
+        const float a = xx / sum - dx * dx + .015f;
+        const float b = xy / sum - dx * dy;
+        const float c = yy / sum - dy * dy + .015f;
+        const float u = xv / sum - dx * mean, v = yv / sum - dy * mean;
+        return mean - ((c * u - b * v) * dx + (a * v - b * u) * dy) / (a * c - b * b);
+    }
+};
+
+float reference_color(const RawPhoto &p, int color, double x, double y) {
+    // Bilinear interpolation on the reference's same-color sites for sparse
+    // coverage, such as the outer margin or very short bursts.
+    double result = 0;
+    int count = 0;
+    for (int site = 0; site < 4; ++site) {
+        if (p.info.cfa[site] != unsigned(color)) continue;
+        const int ox = site & 1, oy = site >> 1;
+        double px = std::clamp((x - ox) * .5, 0.0, double(p.width / 2 - 1));
+        double py = std::clamp((y - oy) * .5, 0.0, double(p.height / 2 - 1));
+        int ax = int(px), ay = int(py);
+        int bx = std::min(ax + 1, int(p.width / 2) - 1), by = std::min(ay + 1, int(p.height / 2) - 1);
+        const double fx = px - ax, fy = py - ay;
+        auto at = [&](int u, int v) { return p.pixels[size_t(2*v + oy) * p.width + 2*u + ox]; };
+        result += (1-fy) * ((1-fx) * at(ax, ay) + fx * at(bx, ay)) +
+                  fy * ((1-fx) * at(ax, by) + fx * at(bx, by));
+        ++count;
+    }
+    return float(result / count - p.black);
+}
+
+constexpr float sr_radius = 1.20f;
+constexpr float sr_radius_squared = sr_radius * sr_radius;
+using Kernel = std::array<float, 1025>;
+
+void accumulate_tile(const RegisteredPhoto &frame, int left, int top, int width, int height,
+                     const Kernel &kernel, std::vector<Moments> &moment) {
+    const auto &p = frame.photo;
+    Position low{double(p.width), double(p.height)}, high{-1, -1};
+    for (int x : {left - 2, left + width / 2 + 2})
+        for (int y : {top - 2, top + height / 2 + 2}) {
+            Position s = frame.forward.at(x, y);
+            low.x = std::min(low.x, s.x); low.y = std::min(low.y, s.y);
+            high.x = std::max(high.x, s.x); high.y = std::max(high.y, s.y);
+        }
+    const int first_x = std::max(0, int(std::floor(low.x))), first_y = std::max(0, int(std::floor(low.y)));
+    const int last_x = std::min(int(p.width) - 1, int(std::ceil(high.x)));
+    const int last_y = std::min(int(p.height) - 1, int(std::ceil(high.y)));
+    constexpr float radius = 2 * sr_radius;
+    for (int y = first_y; y <= last_y; ++y)
+        for (int x = first_x; x <= last_x; ++x) {
+            Position pos = frame.backward.at(x, y);
+            float cx = float(2 * (pos.x - left) + .5), cy = float(2 * (pos.y - top) + .5);
+            const unsigned color = p.info.cfa[(y & 1) * 2 + (x & 1)];
+            const float value = (float(p.pixels[size_t(y) * p.width + x]) - p.black) * frame.exposure;
+            const int y0 = std::max(0, int(std::ceil(cy - radius))), y1 = std::min(height - 1, int(std::floor(cy + radius)));
+            const int x0 = std::max(0, int(std::ceil(cx - radius))), x1 = std::min(width - 1, int(std::floor(cx + radius)));
+            for (int oy = y0; oy <= y1; ++oy)
+                for (int ox = x0; ox <= x1; ++ox) {
+                    float dx = .5f * (cx - ox), dy = .5f * (cy - oy);
+                    float d2 = dx * dx + dy * dy;
+                    if (d2 > sr_radius_squared) continue;
+                    auto weight = kernel[size_t(d2 * ((kernel.size() - 1) / sr_radius_squared))];
+                    moment[3 * (size_t(oy) * width + ox) + color].add(weight, dx, dy, value);
+                }
+        }
+}
+
+void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const SrCrop &crop, const FrameInfo &info,
+                    const std::vector<size_t> &counts, std::vector<SrImage> &results) {
+    constexpr int tile = 128;
+    const int width = int(2 * crop.width), height = int(2 * crop.height);
+    const int columns = (int(crop.width) + tile - 1) / tile, rows = (int(crop.height) + tile - 1) / tile;
+    const auto &ref = frames.front().photo;
+    const float scale = float(65535 / ref.white);
+    Kernel kernel;
+    for (size_t i = 0; i < kernel.size(); ++i) {
+        constexpr float sigma = .42f;
+        float d2 = float(i) * sr_radius_squared / float(kernel.size() - 1);
+        kernel[i] = std::exp(-d2 / (2 * sigma * sigma));
+    }
+    parallel_for(columns * rows, [&](int first, int last) {
+        for (int index = first; index < last; ++index) {
+            const int x0 = 2 * tile * (index % columns), y0 = 2 * tile * (index / columns);
+            const int w = std::min(width - x0, 2 * tile), h = std::min(height - y0, 2 * tile);
+            const int left = int(crop.x) + x0 / 2, top = int(crop.y) + y0 / 2;
+            std::vector<Moments> moment(size_t(w) * h * 3);
+            size_t next = 0;
+            for (size_t n = 0; n < frames.size(); ++n) {
+                accumulate_tile(frames[n], left, top, w, h, kernel, moment);
+                if (n + 1 != counts[next]) continue;
+                SrImage &out = results[next];
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        const size_t i = size_t(y) * w + x, o = size_t(y + y0) * out.width + x + x0;
+                        const unsigned site = info.cfa[(y & 1) * 2 + (x & 1)];
+                        for (unsigned c = 0; c < 3; ++c) {
+                            if (!out.linear && c != site) continue;
+                            const auto &m = moment[3 * i + c];
+                            float v = m.sum > 1e-6f ? m.estimate() : 0;
+                            if (m.sum < .25f) {
+                                float base = reference_color(ref, int(c), left + .5 * x - .25, top + .5 * y - .25);
+                                float w = 4 * m.sum;
+                                v = w * v + (1 - w) * base;
+                            }
+                            uint16_t packed = uint16_t(std::lround(std::clamp((v + ref.black) * scale, 0.0f, float(out.white))));
+                            out.pixels[out.linear ? 3 * o + c : o] = packed;
+                        }
+                    }
+                if (++next == counts.size()) break;
+            }
+        }
+    });
+}
+
+} // namespace
+
+bool superresolve(const ReadPhoto &read, const std::vector<size_t> &candidates, size_t reference,
+                  const SrOptions &opt, const SaveSr &save, std::string &err, const StackLog &log) {
+    RawPhoto ref;
+    if (!read(reference, ref, err)) return false;
+    std::array<unsigned, 4> colors;
+    std::copy_n(ref.info.cfa, colors.size(), colors.begin());
+    std::sort(colors.begin(), colors.end());
+    if ((ref.width | ref.height) & 1 || colors != std::array<unsigned, 4>{0, 1, 1, 2} ||
+        ref.pixels.size() != size_t(ref.width) * ref.height || ref.black >= ref.white || ref.white > 65535) {
+        err = "invalid input geometry, Bayer pattern or raw levels"; return false;
+    }
+    const bool cropped = opt.crop.width != 0;
+    SrCrop crop = cropped ? opt.crop : SrCrop{0, 0, ref.width, ref.height};
+    if (crop.width < 2 || crop.height < 2 || crop.x > ref.width || crop.width > ref.width - crop.x ||
+        crop.y > ref.height || crop.height > ref.height - crop.y) {
+        err = "crop is outside the reference or smaller than 2 pixels"; return false;
+    }
+    if (size_t(crop.width) * crop.height * (opt.linear ? 24 : 8) > UINT32_MAX - (1u << 20)) {
+        err = "output exceeds the DNG writer's 32-bit TIFF limit"; return false;
+    }
+    if (opt.counts.empty() || opt.counts.front() == 0 || opt.counts.back() > candidates.size() ||
+        std::adjacent_find(opt.counts.begin(), opt.counts.end(), std::greater_equal<size_t>{}) != opt.counts.end()) {
+        err = "requested frame count exceeds the selection"; return false;
+    }
+    g_threads = std::max(1u, std::thread::hardware_concurrency());
+    const auto movie = ref.movie;
+    FrameInfo info = ref.info;
+    if (cropped)
+        for (unsigned k = 0; k < 4; ++k)
+            info.cfa[k] = ref.info.cfa[((k >> 1) ^ (crop.y & 1)) * 2 + ((k & 1) ^ (crop.x & 1))];
+    auto crop_movie = [&](unsigned scale) {
+        auto m = movie;
+        m.crop_w = scale * (cropped ? crop.width : movie.crop_w);
+        m.crop_h = scale * (cropped ? crop.height : movie.crop_h);
+        return m;
+    };
+    std::vector<size_t> counts = opt.counts;
+    if (counts.front() == 1) {
+        SrImage single{crop.width, crop.height, ref.black, ref.white, false, {}};
+        single.pixels.resize(size_t(crop.width) * crop.height);
+        for (unsigned y = 0; y < crop.height; ++y)
+            std::copy_n(ref.pixels.data() + size_t(crop.y + y) * ref.width + crop.x, crop.width,
+                        single.pixels.data() + size_t(y) * crop.width);
+        if (!save(1, single, crop_movie(1), info)) return false;
+        counts.erase(counts.begin());
+        if (counts.empty()) return true;
+    }
+
+    auto guide = grey(split(ref.pixels, ref.width, ref.height, float(ref.black), 1, ref.white));
+    auto reference_pyramid = pyramid(guide);
+    auto reference_controls = control_image(std::move(guide));
+    auto points = control_points(reference_controls.fine);
+    std::vector<RegisteredPhoto> frames;
+    frames.reserve(counts.back());
+    frames.push_back({reference, std::move(ref), {}, {}, 1});
+
+    // Start with frames spread over the entire selected interval, then try the
+    // remaining candidates if weaker frames could not be aligned.
+    std::vector<size_t> order;
+    const size_t n = counts.back();
+    for (size_t i = 0; i < n; ++i) order.push_back(candidates[i * (candidates.size() - 1) / (n - 1)]);
+    for (size_t i : candidates)
+        if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+    for (size_t index : order) {
+        if (frames.size() == n) break;
+        if (index == reference) continue;
+        RawPhoto raw;
+        if (!read(index, raw, err)) { log(err + ", skipped"); continue; }
+        const auto &base = frames.front().photo;
+        if (raw.width != base.width || raw.height != base.height || raw.movie.model != base.movie.model ||
+            !std::equal(std::begin(raw.info.cfa), std::end(raw.info.cfa), std::begin(base.info.cfa))) {
+            log("frame " + std::to_string(index) + ": different raw geometry or CFA, skipped");
+            continue;
+        }
+        const float exposure = float(exposure_scale(base.info, raw.info));
+        Img g = grey(split(raw.pixels, raw.width, raw.height, float(raw.black), exposure, raw.white));
+        auto prior = align(reference_pyramid, pyramid(g), 32);
+        auto control = control_image(std::move(g));
+        auto matches = match_controls(reference_controls, control, prior, points);
+        Homography h;
+        size_t inliers = 0;
+        if (!fit_homography(matches, control.fine.w, control.fine.h, h, inliers)) {
+            log("frame " + std::to_string(index) + ": insufficient homography support, skipped");
+            continue;
+        }
+        auto residual = cropped ? refine_crop(reference_controls.fine, control.fine, h, crop) : Position{};
+        auto warp = sensor_map(h, residual);
+        frames.push_back({index, std::move(raw), warp, warp.inverse(), exposure});
+        log("frame " + std::to_string(index) + ": " + std::to_string(inliers) + "/" +
+            std::to_string(matches.size()) + " control points");
+    }
+    if (frames.size() != counts.back()) {
+        err = "aligned " + std::to_string(frames.size()) + " of the requested " + std::to_string(counts.back()) + " frames";
+        return false;
+    }
+    order_by_phase(frames, crop);
+    std::string frame_order = "nested frame order:";
+    for (const auto &frame : frames) frame_order += " " + std::to_string(frame.index);
+    log(frame_order);
+
+    const auto &base = frames.front().photo;
+    const unsigned scale = 65535 / base.white;
+    std::vector<SrImage> results;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        SrImage out{2 * crop.width, 2 * crop.height, scale * base.black, scale * base.white, opt.linear, {}};
+        out.pixels.resize(size_t(out.width) * out.height * (opt.linear ? 3 : 1));
+        results.push_back(std::move(out));
+    }
+    reconstruct_sr(frames, crop, info, counts, results);
+    frames.clear();
+    for (size_t i = 0; i < results.size(); ++i)
+        if (!save(counts[i], results[i], crop_movie(2), info)) return false;
     return true;
 }
 

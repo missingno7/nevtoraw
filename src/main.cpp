@@ -4,8 +4,11 @@
 #include "he_decode.h"
 #include "meta.h"
 #include "nev.h"
+#include "sr.h"
 #include "stack.h"
 
+#include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -19,21 +22,48 @@ namespace fs = std::filesystem;
 static void usage() {
     fprintf(stderr,
             "nevtoraw [dng] <file.NEV> [options]   extract frames as DNG (dng is the default)\n"
+            "nevtoraw dng <file.NEF> [options]    convert one Nikon Z 8 NEF to Bayer DNG\n"
             "nevtoraw stack <file.NEV> [options]   align and average frames into one low-noise DNG\n"
-            "nevtoraw info  <file.NEV>             show clip and frame 0 details\n"
+            "nevtoraw sr <NEF-folder|file.NEV>    reconstruct a 2x LinearRaw DNG\n"
+            "nevtoraw info <file.NEV|file.NEF>    show raw geometry and exposure\n"
             "  -f, --frames LIST   frames: 0 | 0-10 | 0,12,50 | 0-143:6 | all\n"
-            "                      (default: 0 for dng, 0-15 for stack)\n"
+            "                      (default: 0 for dng, 0-15 for stack, all candidates for sr)\n"
             "  -o, --output DIR    output directory (default: next to the NEV)\n"
             "  -c, --compression C ljpeg (default, lossless) | none\n"
             "      --white N       white level (default 16383)\n"
+            "  -r, --ref N         reference frame for stack or sr (default: middle of the list)\n"
+            "  sr only:\n"
+            "      --counts LIST   frame counts, e.g. 1,4,8,16,32 (default: up to 16)\n"
+            "                      count 1 saves the original reference mosaic at native size\n"
+            "      --crop X,Y,W,H  region in reference sensor pixels\n"
+            "      --bayer         export 2x Bayer DNG instead of LinearRaw\n"
             "  stack only:\n"
-            "  -r, --ref N         reference frame (default: middle of the list)\n"
             "      --merge M       mean (default, robust weighted) | median | trimmed-mean\n"
             "                      median and trimmed-mean store 2 bytes per sensor pixel per frame\n"
             "      --trim-percent N  discard N%% from each tail in trimmed-mean (0..49, default 20)\n"
             "      --align MODE    tiles (default) or homography (global perspective)\n"
             "      --no-align      average without alignment (tripod)\n"
             "      --tile N        alignment tile size in sensor pixels (default 64)\n");
+}
+
+static bool nef_path(const fs::path &path) {
+    auto ext = path.extension().string();
+    for (char &c : ext) if (c >= 'A' && c <= 'Z') c = char(c + ('a' - 'A'));
+    return ext == ".nef";
+}
+
+static bool parse_csv(const std::string &s, std::vector<size_t> &values) {
+    const char *p = s.data(), *end = p + s.size();
+    while (p < end) {
+        size_t value;
+        auto result = std::from_chars(p, end, value);
+        if (result.ec != std::errc{}) return false;
+        values.push_back(value);
+        p = result.ptr;
+        if (p == end) return true;
+        if (*p++ != ',') return false;
+    }
+    return false;
 }
 
 static bool parse_frames(const std::string &s, size_t n, std::vector<size_t> &out) {
@@ -61,6 +91,16 @@ static bool parse_frames(const std::string &s, size_t n, std::vector<size_t> &ou
 }
 
 static int cmd_info(const std::string &path) {
+    if (nef_path(fs::u8path(path))) {
+        nev::RawPhoto p;
+        std::string err;
+        if (!nev::read_nef(path, p, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        printf("%s %s, %ux%u coded, %ux%u output\n", p.movie.make.c_str(), p.movie.model.c_str(),
+               p.width, p.height, p.movie.crop_w, p.movie.crop_h);
+        printf("ISO %u, %.6g s, f/%.1f, %.1f mm, black %u, white %u\n", p.info.iso,
+               p.info.exposure, p.info.fnumber, p.info.focal, p.black, p.white);
+        return 0;
+    }
     nev::File f; std::string err;
     if (!f.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
     auto mi = nev::movie_info(f);
@@ -89,6 +129,85 @@ static bool write_file(const fs::path &out, const std::vector<uint8_t> &data) {
     return ok;
 }
 
+static int cmd_sr(const fs::path &input, const fs::path &output, const std::string &frames, long requested_ref,
+                  nev::SrOptions sr, nev::DngOptions dng, bool white_given) {
+    std::vector<fs::path> photos;
+    const bool directory = fs::is_directory(input);
+    nev::File video;
+    nev::MovieInfo video_meta;
+    std::string err;
+    size_t available = 0;
+    if (directory || nef_path(input)) {
+        if (directory) {
+            for (const auto &entry : fs::directory_iterator(input))
+                if (entry.is_regular_file() && nef_path(entry.path())) photos.push_back(entry.path());
+        } else photos.push_back(input);
+        std::sort(photos.begin(), photos.end());
+        available = photos.size();
+    } else {
+        if (!video.open(input.string(), err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        available = video.frame_count();
+        video_meta = nev::movie_info(video);
+    }
+    std::vector<size_t> selected;
+    if (!parse_frames(frames, available, selected)) { fprintf(stderr, "no frames selected\n"); return 2; }
+    size_t ref = requested_ref >= 0 ? size_t(requested_ref) : selected[selected.size() / 2];
+    if (!std::binary_search(selected.begin(), selected.end(), ref)) {
+        fprintf(stderr, "reference must be included in the frame selection\n");
+        return 2;
+    }
+    if (sr.counts.empty()) sr.counts.push_back(std::min<size_t>(16, selected.size()));
+    if (sr.counts.front() == 0 || sr.counts.back() > selected.size()) {
+        fprintf(stderr, "counts must be between 1 and the number of selected frames (%zu)\n", selected.size());
+        return 2;
+    }
+    if (white_given && (dng.white_level == 0 || dng.white_level > 65535)) {
+        fprintf(stderr, "white level must be between 1 and 65535\n"); return 2;
+    }
+    auto read = [&](size_t index, nev::RawPhoto &p, std::string &read_error) {
+        if (!photos.empty()) {
+            if (!nev::read_nef(photos[index].u8string(), p, read_error)) return false;
+        } else {
+            nev::Frame frame;
+            if (!video.read_frame(index, frame, read_error) ||
+                !nefcomp::he_decode(frame.codestream(), frame.cs_len, frame.width, frame.height, p.pixels, read_error))
+                return false;
+            p.width = frame.width; p.height = frame.height; p.black = nev::black_level(frame);
+            p.info = nev::frame_info(frame); p.movie = video_meta;
+        }
+        if (white_given) p.white = dng.white_level;
+        if (p.white <= p.black) { read_error = "white level must exceed black level"; return false; }
+        return true;
+    };
+    fs::path outdir = output.empty() ? (directory ? input : input.parent_path()) : output;
+    if (!outdir.empty()) fs::create_directories(outdir);
+    auto source_name = photos.empty() ? input.filename().u8string() : photos[ref].filename().u8string();
+    auto stem = fs::u8path(source_name).stem().u8string();
+    printf("reference %zu (%s), %zu candidates\n", ref, source_name.c_str(), selected.size());
+    const auto t0 = std::chrono::steady_clock::now();
+    auto save = [&](size_t count, const nev::SrImage &image, const nev::MovieInfo &movie, const nev::FrameInfo &info) {
+        dng.black_level = image.black; dng.white_level = image.white;
+        dng.linear_rgb = image.linear;
+        const char *format = count == 1 ? "native Bayer" : image.linear ? "2x LinearRaw" : "2x Bayer";
+        dng.description = "nevtoraw " + std::string(format) + ", " + std::to_string(count) +
+                          " frame(s), reference " + std::to_string(ref);
+        const std::string suffix = count == 1 ? "_native_1" : (image.linear ? "_sr2x_linear_" : "_sr2x_bayer_") +
+                                                             std::to_string(count);
+        const auto path = outdir / fs::u8path(stem + suffix + ".dng");
+        auto bytes = nev::build_dng(image.pixels, image.width, image.height, movie, info,
+                                    photos.empty() ? ref : 0, source_name, dng);
+        if (!write_file(path, bytes)) { err = "could not save " + path.u8string(); return false; }
+        printf("%s  %.1f MB\n", path.string().c_str(), bytes.size() / 1e6);
+        return true;
+    };
+    if (!nev::superresolve(read, selected, ref, sr, save, err, [](const std::string &s) { printf("  %s\n", s.c_str()); })) {
+        fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    printf("finished in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
     std::string cmd = argv[1];
@@ -98,20 +217,22 @@ int main(int argc, char **argv) {
     }
     // "dng" is the default: `nevtoraw <file.NEV> [options]` == `nevtoraw dng <file.NEV> [options]`
     int first = 2;
-    bool stack = false;
-    if (cmd == "dng" || cmd == "stack") {
+    bool stack = false, sr = false;
+    if (cmd == "dng" || cmd == "stack" || cmd == "sr") {
         if (argc < 3) { usage(); return 2; }
         stack = cmd == "stack";
+        sr = cmd == "sr";
         first = 3;
     } else if (cmd.empty() || cmd[0] == '-') {
         usage(); return 2;
     }
     std::string path = argv[first - 1];
-    std::string frames = stack ? "0-15" : "0", outdir;
+    std::string frames = sr ? "all" : stack ? "0-15" : "0", outdir;
     long ref = -1;
     nev::DngOptions opt;
     nev::StackOptions sopt;
-    bool trim_given = false;
+    nev::SrOptions sr_opt;
+    bool trim_given = false, white_given = false;
     for (int i = first; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
@@ -122,8 +243,23 @@ int main(int argc, char **argv) {
             if (c == "none") opt.compression = nev::DngCompression::None;
             else if (c == "ljpeg") opt.compression = nev::DngCompression::LosslessJpeg;
             else { usage(); return 2; }
-        } else if (a == "--white") opt.white_level = sopt.white = unsigned(atoi(next().c_str()));
-        else if (stack && (a == "-r" || a == "--ref")) ref = atol(next().c_str());
+        } else if (a == "--white") {
+            opt.white_level = sopt.white = unsigned(atoi(next().c_str()));
+            white_given = true;
+        } else if ((stack || sr) && (a == "-r" || a == "--ref")) ref = atol(next().c_str());
+        else if (sr && a == "--counts") {
+            sr_opt.counts.clear();
+            if (!parse_csv(next(), sr_opt.counts)) { fprintf(stderr, "bad frame counts\n"); return 2; }
+            std::sort(sr_opt.counts.begin(), sr_opt.counts.end());
+            sr_opt.counts.erase(std::unique(sr_opt.counts.begin(), sr_opt.counts.end()), sr_opt.counts.end());
+        } else if (sr && a == "--crop") {
+            std::vector<size_t> values;
+            if (!parse_csv(next(), values) || values.size() != 4 || values[2] == 0 || values[3] == 0 ||
+                *std::max_element(values.begin(), values.end()) > UINT32_MAX) {
+                fprintf(stderr, "crop must be X,Y,W,H\n"); return 2;
+            }
+            sr_opt.crop = {unsigned(values[0]), unsigned(values[1]), unsigned(values[2]), unsigned(values[3])};
+        } else if (sr && a == "--bayer") sr_opt.linear = false;
         else if (stack && a == "--no-align") sopt.alignment = nev::StackAlignment::None;
         else if (stack && a == "--align") {
             std::string mode = next();
@@ -156,6 +292,23 @@ int main(int argc, char **argv) {
     if (trim_given && !trimmed) {
         fprintf(stderr, "--trim-percent requires --merge trimmed-mean\n");
         return 2;
+    }
+    if (sr) return cmd_sr(fs::u8path(path), fs::u8path(outdir), frames, ref, sr_opt, opt, white_given);
+    if (!stack && nef_path(fs::u8path(path))) {
+        if (frames != "0" && frames != "all") { fprintf(stderr, "a NEF only has frame 0\n"); return 2; }
+        nev::RawPhoto p;
+        std::string err;
+        if (!nev::read_nef(path, p, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        const fs::path in = fs::u8path(path);
+        const fs::path dir = outdir.empty() ? in.parent_path() : fs::u8path(outdir);
+        if (!dir.empty()) fs::create_directories(dir);
+        opt.black_level = p.black;
+        if (!white_given) opt.white_level = p.white;
+        const auto dest = dir / (in.stem().string() + ".dng");
+        auto data = nev::build_dng(p.pixels, p.width, p.height, p.movie, p.info, 0, in.filename().u8string(), opt);
+        if (!write_file(dest, data)) return 1;
+        printf("%s  %.1f MB\n", dest.string().c_str(), data.size() / 1e6);
+        return 0;
     }
     nev::File f; std::string err;
     if (!f.open(path, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }

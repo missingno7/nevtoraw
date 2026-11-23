@@ -1,11 +1,14 @@
 # nevtoraw
 
-Extracts frames of Nikon **N-RAW** video (`.NEV`, e.g. Z 8) as raw stills.
+Extracts Nikon **N-RAW** video (`.NEV`) as raw stills and reconstructs higher-resolution
+DNGs from N-RAW clips or Nikon Z 8 NEF bursts.
 
 ```
 nevtoraw [dng] <file.NEV> [-f 0 | 0-10 | 0,12,50 | 0-143:6 | all] [-o DIR] [-c ljpeg|none] [--white N]
+nevtoraw dng <file.NEF> [-o DIR] [-c ljpeg|none]
 nevtoraw stack <file.NEV> [-f 0-15] [--merge mean|median|trimmed-mean] [--trim-percent 20] [-r REF] [--align tiles|homography | --no-align] [--tile 64] [-o DIR] [-c ljpeg|none]
-nevtoraw info  <file.NEV>
+nevtoraw sr <NEF-folder|file.NEV> [--counts 1,4,8,16,32] [--crop X,Y,W,H] [--bayer] [-f all] [-r REF] [-o DIR] [-c ljpeg|none]
+nevtoraw info <file.NEV|file.NEF>
 ```
 
 `dng` is the default, so `nevtoraw clip.NEV -f all -o out` works. Without `-f` only frame 0 is
@@ -154,7 +157,30 @@ Measured on the 4.1K clip (G plane, flat areas, high-pass noise; the single fram
 * **Cost** (16 frames): 4.1K about 3.5 s; 8.3K about 12.5 s, with 1.2 GB peak (mean) or 2.3 GB
   (median, plus 77 MB per extra frame).
 
-### NEF (not pursued)
+### Burst super-resolution (`sr`)
+
+By default `sr` writes a **2× LinearRaw DNG**, in the camera's native RGB with the
+reference frame's white balance and profile. It registers the burst with homographies
+and reconstructs each output channel from original CFA samples at their shifted
+positions. `--bayer` writes a 2× Bayer mosaic for Camera Raw to demosaic. For a crop,
+the global registration also gets a local translation refinement.
+
+```
+nevtoraw sr examples/2 --counts 1,4,8,16,32 --crop 3010,1534,600,490 -o out/sr-compare
+```
+
+NEF directories are sorted by filename. `-f` selects candidates and `-r` chooses a
+reference from that selection. Without `--counts`, up to 16 frames are used. Count
+`1` saves the native reference mosaic, and larger counts use nested subsets of the
+same burst with distinct subpixel phases prioritized first. Coordinates for `--crop`
+are zero-based in the reference's coded sensor grid. Omitting the crop reconstructs
+the whole image. A 2× linear output has four times as many pixels as the input and
+three 16-bit samples per pixel. A static subject with sharp source frames works best.
+
+The native NEF reader supports Nikon Z 8 compressed Bayer stills in HE, HE★ and
+lossless modes. Nikon lossless decoding is adapted from [nefcomp](https://github.com/missingno7/nefcomp).
+
+### NEV codestreams in NEF wrappers
 A frame's codestream placed unchanged into a Z 8 HE NEF opens in Adobe DNG Converter and decodes
 bit-identically, which independently confirms the 8.3K decode. Adobe gives such NEFs a centred
 DX-sized crop (5392×3592) whatever the makernote says, and rejects the smaller 4.1K/UHD sizes,
