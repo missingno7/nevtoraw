@@ -1,4 +1,4 @@
-"""Self-contained CLI regression checks. Run after raw-input-test.exe."""
+"""Self-contained CLI regression checks. Run after the native test executable."""
 from pathlib import Path
 import hashlib
 import shutil
@@ -8,7 +8,7 @@ import sys
 import array
 import importlib.util
 
-binary = Path(sys.argv[1] if len(sys.argv) > 1 else "nevtoraw.exe").resolve()
+binary = Path(sys.argv[1] if len(sys.argv) > 1 else "nevtoraw.exe" if sys.platform == "win32" else "nevtoraw").resolve()
 root = Path("out/cli-tests")
 assert root.resolve().parent == Path("out").resolve()
 if root.exists():

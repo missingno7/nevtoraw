@@ -1,8 +1,10 @@
 # Change history
 
-## 0.2.0
+## 0.2.0 — 2026-11-24
 
 - Shared NEV, NEF, NRW, and Bayer DNG input for conversion, stacking, SR, and folder inspection.
+- Windows x64 and Linux x64 binaries with the C++ runtime included, both built
+  and tested in CI and packaged with matching source and checksums.
 - Shared `--crop` for conversion, stacking, and SR, preserving Bayer/black-level phase.
 - Lossless JPEG strips for small crops, avoiding padded-row decoding errors in raw converters.
 - Z 6/Z 7 support and broader Nikon decoders/calibrations reused from nefcomp.

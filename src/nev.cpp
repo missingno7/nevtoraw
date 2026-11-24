@@ -13,7 +13,7 @@ inline uint64_t be64(const uint8_t *p) { return uint64_t(be32(p)) << 32 | be32(p
 inline uint16_t be16(const uint8_t *p) { return uint16_t(p[0] << 8 | p[1]); }
 
 bool fread_at(FILE *fp, uint64_t off, void *dst, size_t n) {
-    if (_fseeki64(fp, int64_t(off), SEEK_SET)) return false;
+    if (!seek_file(fp,int64_t(off))) return false;
     return fread(dst, 1, n, fp) == n;
 }
 
@@ -63,7 +63,8 @@ bool File::open(const std::string &path, std::string &err) {
     width = height = timescale = 0;
     fp = open_file(path, "rb");
     if (!fp) { err = "cannot open " + path; return false; }
-    _fseeki64(fp, 0, SEEK_END); size = uint64_t(_ftelli64(fp));
+    if(!seek_file(fp,0,SEEK_END)||tell_file(fp)<0){err="cannot size "+path;return false;}
+    size=uint64_t(tell_file(fp));
     // find moov at top level
     uint64_t p = 0, moov_off = 0, moov_size = 0;
     while (p + 8 <= size) {

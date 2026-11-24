@@ -11,6 +11,21 @@
 #endif
 
 namespace nev {
+bool seek_file(FILE *file,int64_t offset,int origin) {
+#ifdef _WIN32
+    return _fseeki64(file,offset,origin)==0;
+#else
+    static_assert(sizeof(off_t)>=8,"64-bit file offsets required");
+    return fseeko(file,off_t(offset),origin)==0;
+#endif
+}
+int64_t tell_file(FILE *file) {
+#ifdef _WIN32
+    return _ftelli64(file);
+#else
+    return int64_t(ftello(file));
+#endif
+}
 FILE *open_file(const std::string &path, const char *mode) {
 #ifdef _WIN32
     return _wfopen(std::filesystem::u8path(path).c_str(), std::filesystem::path(mode).c_str());

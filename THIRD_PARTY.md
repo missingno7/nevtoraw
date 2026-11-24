@@ -26,7 +26,9 @@ This product includes DNG technology under license by Adobe. Nikon, Adobe, and
 intoPIX are trademarks of their respective owners. This is an independent
 interoperability project; no endorsement is implied.
 
-Windows binaries statically link MinGW-w64/GCC runtime components. The GCC Runtime
+Windows binaries statically link MinGW-w64/GCC runtime components; Linux binaries
+statically link GCC runtime components and use the operating system's glibc.
+The GCC Runtime
 Library Exception applies to eligible runtime components. Source packages contain
 the application, decoder sources/licenses, tests, and build instructions needed to
 rebuild the executable.

@@ -1,21 +1,36 @@
-"""Create deterministic source and Windows archives from this working tree."""
+"""Package a native Windows/Linux executable together with matching source."""
 from pathlib import Path
 import argparse
 import hashlib
+import gzip
+import io
 import re
 import subprocess
+import sys
+import tarfile
 import zipfile
 
 
 def main():
     repository = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=repository / "nevtoraw.exe")
+    parser.add_argument("--platform", choices=("windows-x64", "linux-x64"),
+                        default="windows-x64" if sys.platform == "win32" else "linux-x64")
+    parser.add_argument("--binary", type=Path)
     parser.add_argument("--output", type=Path, default=repository / "out/release")
     args = parser.parse_args()
     version_text = (repository / "src/version.h").read_text(encoding="utf-8")
     version = re.search(r'version = "([0-9.]+)"', version_text).group(1)
-    binary = args.binary.resolve()
+    executable = "nevtoraw.exe" if args.platform == "windows-x64" else "nevtoraw"
+    binary = (args.binary or repository / executable).resolve()
+    header = binary.read_bytes()[:4096]
+    if args.platform == "linux-x64":
+        if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != 62:
+            parser.error("expected a little-endian Linux x86-64 ELF executable")
+    else:
+        pe = int.from_bytes(header[60:64], "little")
+        if header[:2] != b"MZ" or header[pe:pe+6] != b"PE\0\0\x64\x86":
+            parser.error("expected a Windows x64 PE executable")
     reported = subprocess.check_output([str(binary), "--version"], text=True).strip()
     if reported != f"nevtoraw {version}":
         parser.error("binary version differs from src/version.h; rebuild first")
@@ -37,20 +52,34 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     archives = []
-    for kind in ("source", "windows-x64"):
+    for kind in ("source", args.platform):
         stem = f"nevtoraw-{version}-{kind}"
-        path = output / f"{stem}.zip"
         contents = dict(payloads)
-        if kind == "windows-x64":
-            contents["nevtoraw.exe"] = binary.read_bytes()
-        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-            for name, data in sorted(contents.items()):
-                entry = zipfile.ZipInfo(f"{stem}/{name}", date_time=(1980, 1, 1, 0, 0, 0))
-                entry.compress_type = zipfile.ZIP_DEFLATED
-                entry.external_attr = 0o100644 << 16
-                archive.writestr(entry, data, compresslevel=9)
-        with zipfile.ZipFile(path) as archive:
-            assert archive.testzip() is None
+        if kind != "source":
+            contents[executable] = binary.read_bytes()
+        if kind == "linux-x64":
+            path = output / f"{stem}.tar.gz"
+            with path.open("wb") as file, gzip.GzipFile(filename="", fileobj=file, mode="wb", mtime=0) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                    for name, data in sorted(contents.items()):
+                        entry = tarfile.TarInfo(f"{stem}/{name}")
+                        entry.size = len(data)
+                        entry.mode = 0o755 if name == executable else 0o644
+                        archive.addfile(entry, io.BytesIO(data))
+            with tarfile.open(path) as archive:
+                for entry in archive:
+                    assert archive.extractfile(entry).read() == contents[entry.name.split("/", 1)[1]]
+        else:
+            path = output / f"{stem}.zip"
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+                for name, data in sorted(contents.items()):
+                    entry = zipfile.ZipInfo(f"{stem}/{name}", date_time=(1980, 1, 1, 0, 0, 0))
+                    entry.create_system = 3
+                    entry.compress_type = zipfile.ZIP_DEFLATED
+                    entry.external_attr = (0o100755 if name == executable else 0o100644) << 16
+                    archive.writestr(entry, data, compresslevel=9)
+            with zipfile.ZipFile(path) as archive:
+                assert archive.testzip() is None
         archives.append(path)
         print(path)
     (output / "SHA256SUMS.txt").write_text("".join(

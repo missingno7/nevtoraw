@@ -6,6 +6,8 @@
 *.exe
 *.o
 *.part
+/nevtoraw
+/raw-input-test
 
 # Raw/image/video files anywhere
 *.NEV

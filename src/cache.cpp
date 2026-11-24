@@ -41,11 +41,7 @@ ScratchFile::ScratchFile(){
 ScratchFile::~ScratchFile(){if(file_)std::fclose(file_);}
 namespace {
 void seek(FILE *file,uint64_t offset){
-#ifdef _WIN32
-    if(_fseeki64(file,int64_t(offset),SEEK_SET))throw std::runtime_error("scratch seek failed");
-#else
-    if(fseeko(file,off_t(offset),SEEK_SET))throw std::runtime_error("scratch seek failed");
-#endif
+    if(!seek_file(file,int64_t(offset)))throw std::runtime_error("scratch seek failed");
 }
 }
 uint64_t ScratchFile::append(const void *data,size_t bytes){

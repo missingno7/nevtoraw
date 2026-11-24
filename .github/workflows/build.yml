@@ -8,6 +8,36 @@ permissions:
   contents: read
 
 jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build Linux x64 binary and run generated-fixture tests
+        run: make test
+      - name: Verify only system C runtime libraries are needed
+        run: |
+          file nevtoraw
+          ldd nevtoraw
+          if readelf -d nevtoraw | grep NEEDED | grep -Eq 'libstdc\+\+|libgcc_s'; then
+            echo "Linux release binary must include its C++ runtime"
+            exit 1
+          fi
+          ./nevtoraw --version
+      - name: Package binary and matching source
+        run: python3 tools/package_release.py
+      - name: Smoke-test the extracted Linux package
+        run: |
+          mkdir -p out/package-smoke
+          tar -xzf out/release/nevtoraw-*-linux-x64.tar.gz -C out/package-smoke
+          out/package-smoke/nevtoraw-*-linux-x64/nevtoraw --version
+          out/package-smoke/nevtoraw-*-linux-x64/nevtoraw cameras
+          cd out/release
+          sha256sum --check SHA256SUMS.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: nevtoraw-linux-x64
+          path: out/release/*
+          if-no-files-found: error
   windows:
     runs-on: windows-latest
     defaults:

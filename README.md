@@ -2,7 +2,20 @@
 
 Export Nikon N-RAW (`.NEV`) frames as Bayer DNGs, stack handheld raw bursts, and
 reconstruct higher-resolution images directly from their original CFA samples.
-Version **0.2.0**, Windows x64, one standalone executable.
+Version **0.2.0**, Windows and Linux x64, one standalone executable.
+
+Download the binary archive and checksums from the
+[v0.2.0 release](https://github.com/missingno7/nevtoraw/releases/tag/v0.2.0).
+Windows uses `nevtoraw.exe`; Linux uses `nevtoraw` from the `.tar.gz` archive:
+
+```sh
+tar -xzf nevtoraw-0.2.0-linux-x64.tar.gz
+./nevtoraw-0.2.0-linux-x64/nevtoraw --help
+```
+
+Both binary packages include matching source and license notices. Linux x64
+requires glibc 2.35 or newer (Ubuntu 22.04 or newer, for example); it needs no
+separately installed C++ runtime or raw decoder. Alpine/musl is not a release target.
 
 ## Quick start
 
@@ -121,6 +134,17 @@ pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make mingw-w6
 mingw32-make
 mingw32-make test
 ```
+
+On Linux x64, use GCC, Make, and Python 3 (on Ubuntu: `sudo apt install build-essential python3`):
+
+```sh
+make test
+./nevtoraw --version
+python3 tools/package_release.py
+```
+
+Linux links its C++ runtime statically and uses the OS C runtime. Override
+`LDFLAGS` for other local linking choices. Release CI builds and tests both platforms.
 
 No Adobe Converter, `nefcomp`, LibRaw installation, or additional runtime DLLs are
 needed to use the executable. Python is used only by CLI tests and release packaging.

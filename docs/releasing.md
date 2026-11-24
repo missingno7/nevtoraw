@@ -1,7 +1,9 @@
 # Release validation
 
-The supported release target is Windows x64 with MSYS2 MinGW-w64 and C++17.
-The executable is statically linked. `src/version.h` is the version source for
+Release targets are Windows x64 with MSYS2 MinGW-w64 and Linux x64 with GCC/C++17.
+Windows links its non-system dependencies statically. Linux CI uses Ubuntu 22.04,
+links GCC/C++ runtimes statically, and uses the OS glibc 2.35 or newer.
+`src/version.h` is the version source for
 `--version`, the DNG Software tag, and archive names. Update README, changelog,
 and the CLI version assertion when changing it.
 
@@ -16,6 +18,10 @@ From the UCRT64 shell in a fresh checkout (the existing MINGW64 toolchain also b
 mingw32-make test
 python tools/package_release.py
 ```
+
+On Linux x64, use `make test` followed by `python3 tools/package_release.py`.
+The Makefile selects native executable names, POSIX 64-bit file seeking, and
+pthread flags automatically. `TARGET`, `TEST_TARGET`, and `PYTHON` can be overridden.
 
 For a clean build, run `mingw32-make clean` first. The test target builds the CLI
 and a native test executable, then runs generated fixtures and Python CLI checks.
@@ -64,8 +70,13 @@ than its C++ sources. It creates:
 
 - `out/release/nevtoraw-VERSION-windows-x64.zip`, including the executable,
   complete matching source, documentation, tests, and license notices.
+- `out/release/nevtoraw-VERSION-linux-x64.tar.gz` when packaging on Linux, with
+  the same source and notices plus an executable with mode 0755 and its C++ runtime included.
 - `out/release/nevtoraw-VERSION-source.zip`, the same source without a binary.
-- `out/release/SHA256SUMS.txt`, checksums of both archives.
+- `out/release/SHA256SUMS.txt`, checksums of that build's archives.
+
+The packager defaults to the host platform and supports `--platform`, `--binary`,
+and `--output` overrides. It verifies the executable architecture and version.
 
 Each package has a `SOURCE-SHA256.txt` listing its source snapshot. Packaging uses
 an explicit source-directory list, excludes footage/build output, and includes
@@ -73,9 +84,14 @@ uncommitted source changes so local review packages match the working tree. For
 a public release, build/package from the final committed revision and verify
 `git status --short` is empty. Never include `examples/`, `out/`, or personal footage.
 
-Unpack the Windows archive into an empty directory, check `nevtoraw.exe --version`
-and `--help`, and verify the archive checksums. Rebuilding the supplied source must
+Unpack each binary archive into an empty directory, check `--version` and `--help`,
+and verify archive checksums. For Linux, verify the extracted executable can run
+and `readelf -d nevtoraw` has no libstdc++ or libgcc_s dependency. Rebuilding the supplied source must
 pass the same test target. The CI workflow performs Windows build, tests, packaging,
 and artifact upload on pushes and pull requests; it does not publish GitHub releases.
 
 Tagging, pushing, and publishing release assets are separate release operations.
+For a release, wait for both platform jobs at the intended commit, collect their
+binary archives and one source archive, and verify their SOURCE-SHA256 manifests
+match. Generate a combined SHA256SUMS.txt for the three archives. Create the
+version tag at that exact commit and publish all four assets together.
