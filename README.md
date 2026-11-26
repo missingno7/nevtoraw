@@ -90,6 +90,22 @@ frame and crops its result; SR reconstructs the requested region. For example:
 .\nevtoraw.exe dng photo.NEF --crop 1000,1000,256,256
 ```
 
+Deep shadows in a long stack expose small errors in the camera's recorded black
+level: once noise is averaged away, a colour whose true black sits below the tag
+falls below black and raw converters clip it, tinting the darkest tones. `--dark`
+measures per-colour black levels from lens-cap frames shot at the same settings;
+`--black` sets them directly. Both are shared by `dng`, `stack`, and `sr`:
+
+```powershell
+.\nevtoraw.exe stack examples\night --dark examples\night-dark --merge trimmed-mean
+.\nevtoraw.exe stack examples\night --black 1008,1008,1007.4
+.\nevtoraw.exe stack examples\night --black auto
+```
+
+`stack --black auto` (also for `sr`) needs no dark frames: after merging, it sets each colour so
+the darkest 64×64 px areas of the scene average exactly black. Use it for scenes
+that contain real shadows.
+
 Use a small crop for initial SR experiments. `--bayer` requests a mosaic
 instead of the default camera-native RGB LinearRaw DNG. Both retain calibration
 and white balance for subsequent processing.

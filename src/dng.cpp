@@ -140,6 +140,14 @@ static tiffw::Ifd dng_metadata(unsigned W, unsigned H, const MovieInfo &mi,
             black.push_back(opt.black_level + fi.black_delta[site]);
         }
         raw.add_rational(0xc61a, black);
+    } else if (opt.linear_rgb && std::any_of(std::begin(opt.sample_black_delta), std::end(opt.sample_black_delta), [](double v) { return v != 0; })) {
+        std::vector<double> black;
+        for (double delta : opt.sample_black_delta) {
+            if (!std::isfinite(delta) || opt.black_level + delta < 0 || opt.black_level + delta >= opt.white_level)
+                throw std::runtime_error("invalid output channel black level");
+            black.push_back(opt.black_level + delta);
+        }
+        raw.add_rational(0xc61a, black);
     } else raw.add_long(0xc61a, std::vector<uint32_t>(channels, opt.black_level));
     raw.add_long(0xc61d, std::vector<uint32_t>(channels, opt.white_level));
     if (mi.default_scale_x != 1 || mi.default_scale_y != 1)

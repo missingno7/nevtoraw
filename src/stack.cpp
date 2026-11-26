@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "stack.h"
+#include "black.h"
 #include "sr.h"
 
 #include "meta.h"
@@ -564,13 +565,19 @@ bool make_footprint(const Planes &src, float x, float y, Footprint &f) {
     return true;
 }
 
+// Catmull-Rom, limited to the range of the four nearest samples. The negative lobes
+// otherwise ring next to bright edges (a street light can pull its dark surroundings
+// hundreds of DN below black), and every aligned frame repeats the same undershoot.
 float interpolate(const Img &img, const Footprint &f) {
     float acc = 0;
     for (int j = 0; j < 4; ++j) {
         const float *r = &img.d[size_t(f.y - 1 + j) * img.w + f.x - 1];
         acc += f.wy[j] * (f.wx[0] * r[0] + f.wx[1] * r[1] + f.wx[2] * r[2] + f.wx[3] * r[3]);
     }
-    return acc;
+    const float *a = &img.d[size_t(f.y) * img.w + f.x], *b = a + img.w;
+    const float lo = std::min(std::min(a[0], a[1]), std::min(b[0], b[1]));
+    const float hi = std::max(std::max(a[0], a[1]), std::max(b[0], b[1]));
+    return std::clamp(acc, lo, hi);
 }
 
 // Resample the four planes separately; valid marks quads with an unclipped footprint.
@@ -914,6 +921,47 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
         if(cached_samples.spilled())log("aligned cache: "+std::to_string(cached_samples.spilled()>>20)+" MiB in temporary storage");
     }
 
+    // Optional normalization: the darkest part of the merged image defines black, per CFA site.
+    // Area mode uses 64x64 px block means and a low order statistic that tolerates a few
+    // outlier blocks; pixel mode uses the single darkest sample, noise included.
+    float offset[4] = {};
+    if (opt.auto_black == AutoBlack::Pixel) {
+        for (int k = 0; k < 4; ++k) {
+            float low = std::numeric_limits<float>::infinity();
+            for (size_t o = 0; o < acc.p[k].d.size(); ++o) low = std::min(low, acc.p[k].d[o] / wsum.d[o]);
+            offset[k] = low;
+        }
+    } else if (opt.auto_black == AutoBlack::Area) {
+        const int B = std::max(1, std::min({32, R.w, R.h}));
+        const int bw = R.w / B, bh = R.h / B;
+        const size_t n = size_t(bw) * bh;
+        const size_t rank = std::min<size_t>(4, n / 20) + n / 2000;
+        std::vector<double> means(n);
+        for (int k = 0; k < 4; ++k) {
+            for (int by = 0; by < bh; ++by) for (int bx = 0; bx < bw; ++bx) {
+                double s = 0;
+                for (int y = by * B; y < (by + 1) * B; ++y) for (int x = bx * B; x < (bx + 1) * B; ++x) {
+                    const size_t o = size_t(y) * R.w + x;
+                    s += acc.p[k].d[o] / wsum.d[o];
+                }
+                means[size_t(by) * bw + bx] = s / (double(B) * B);
+            }
+            std::nth_element(means.begin(), means.begin() + long(rank), means.end());
+            offset[k] = float(means[rank]);
+        }
+    }
+    for (unsigned k = 0; k < 4; ++k)
+        out.black_level[black_slot(ref_info.cfa, k)] = black + ref_info.black_delta[k] + offset[k];
+    if (opt.auto_black != AutoBlack::Off) {
+        char b[256];
+        double shift[4];
+        for (unsigned k = 0; k < 4; ++k) shift[black_slot(ref_info.cfa, k)] = offset[k];
+        snprintf(b, sizeof b, "auto black: darkest %s R %+.3f Gr %+.3f Gb %+.3f B %+.3f DN -> black R %.2f Gr %.2f Gb %.2f B %.2f DN",
+                 opt.auto_black == AutoBlack::Pixel ? "pixels" : "areas",
+                 shift[0], shift[1], shift[2], shift[3], out.black_level[0], out.black_level[1], out.black_level[2], out.black_level[3]);
+        log(b);
+    }
+
     // output: scaled 16-bit mosaic
     const float S = float(65535 / reference.white);
     out.width = W; out.height = H;
@@ -925,7 +973,7 @@ bool stack_frames(const ReadPhoto &read, const std::vector<size_t> &frames, size
             for (int x = 0; x < R.w; x++) {
                 size_t o = size_t(y) * R.w + x;
                 for (int k = 0; k < 4; k++) {
-                    float v = acc.p[k].d[o] / wsum.d[o];
+                    float v = acc.p[k].d[o] / wsum.d[o] - offset[k];
                     float q = std::round(v * S + black * S);
                     out.px[size_t(2 * y + (k >> 1)) * W + 2 * x + (k & 1)] = uint16_t(std::clamp(q, 0.0f, 65535.0f));
                 }
@@ -1149,6 +1197,55 @@ void reconstruct_sr(const std::vector<RegisteredPhoto> &frames, const Crop &crop
     },concurrency);
 }
 
+// SR black normalization, measured on the packed output (64x64 input px blocks or single
+// samples per colour) and stored as fractional DNG black levels, so samples are not requantized.
+void sr_auto_black(SrImage &out, FrameInfo &info, const RawPhoto &ref, unsigned scale, unsigned code_scale,
+                   AutoBlack mode, const StackLog &log) {
+    const bool area = mode == AutoBlack::Area;
+    const unsigned W = out.width, H = out.height, channels = out.linear ? 3 : 1;
+    const unsigned B = area ? std::max(1u, std::min({64 * scale, W, H})) : 1;
+    const unsigned bw = W / B, bh = H / B, rows = area ? bh * B : H, strip = area ? B : std::min(H, 256u);
+    std::vector<double> sum(area ? size_t(bw) * bh * 3 : 0);
+    std::vector<uint32_t> count(sum.size());
+    double low[3] = {INFINITY, INFINITY, INFINITY};
+    std::vector<uint16_t> buffer(size_t(strip) * W * channels);
+    for (unsigned y0 = 0; y0 < rows; y0 += strip) {
+        const unsigned h = std::min(strip, rows - y0);
+        if (out.storage) out.storage->read(0, y0, W, h, buffer.data());
+        else std::copy_n(out.pixels.begin() + long(size_t(y0) * W * channels), size_t(h) * W * channels, buffer.begin());
+        for (unsigned r = 0; r < h; ++r)
+            for (unsigned x = 0; x < W; ++x)
+                for (unsigned i = 0; i < channels; ++i) {
+                    const unsigned c = out.linear ? i : info.cfa[((y0 + r) & 1) * 2 + (x & 1)];
+                    const double v = (double(buffer[(size_t(r) * W + x) * channels + i]) - out.black) / code_scale;
+                    if (!area) low[c] = std::min(low[c], v);
+                    else if (x < bw * B) {
+                        const size_t b = (size_t((y0 + r) / B) * bw + x / B) * 3 + c;
+                        sum[b] += v; ++count[b];
+                    }
+                }
+    }
+    double offset[3];
+    for (unsigned c = 0; c < 3; ++c) {
+        if (!area) { offset[c] = low[c]; continue; }
+        std::vector<double> means;
+        for (size_t b = c; b < sum.size(); b += 3) if (count[b]) means.push_back(sum[b] / count[b]);
+        const size_t rank = std::min<size_t>(4, means.size() / 20) + means.size() / 2000;
+        std::nth_element(means.begin(), means.begin() + long(rank), means.end());
+        offset[c] = means[rank];
+    }
+    for (unsigned c = 0; c < 3; ++c) out.black_delta[c] = offset[c] * code_scale;
+    for (unsigned k = 0; k < 4; ++k) {
+        out.black_level[black_slot(info.cfa, k)] = ref.black + ref.info.black_delta[k] + offset[info.cfa[k]];
+        if (!out.linear) info.black_delta[k] = float(out.black_delta[info.cfa[k]]);
+    }
+    char b[256];
+    snprintf(b, sizeof b, "auto black: darkest %s R %+.3f G %+.3f B %+.3f DN -> black R %.2f Gr %.2f Gb %.2f B %.2f DN",
+             area ? "areas" : "pixels", offset[0], offset[1], offset[2],
+             out.black_level[0], out.black_level[1], out.black_level[2], out.black_level[3]);
+    log(b);
+}
+
 } // namespace
 
 bool superresolve(const ReadPhoto &read, const std::vector<size_t> &selected, size_t reference,
@@ -1250,6 +1347,7 @@ bool superresolve(const ReadPhoto &read, const std::vector<size_t> &selected, si
     if(output_memory)out.pixels.resize(sample_count);
     else out.storage=std::make_shared<TiledImage>(out.width,out.height,opt.linear?3:1,unsigned(out_tile));
     reconstruct_sr(frames,crop,info,out,opt.kernel_sigma,int(opt.scale),tile,concurrency,*cache);
+    if(opt.auto_black!=AutoBlack::Off)sr_auto_black(out,info,base,opt.scale,code_scale,opt.auto_black,log);
     if(cache->spilled())log("raw cache: "+std::to_string(cache->spilled()>>20)+" MiB in temporary storage");
     if(out.storage&&out.storage->spilled())log("output cache: "+std::to_string(out.storage->spilled()>>20)+" MiB in temporary storage");
     frames.clear();cache.reset();working=MemoryLease{};reconstruction=MemoryLease{};

@@ -1,5 +1,17 @@
 # Change history
 
+## Unreleased
+
+- `--dark PATH` measures per-colour black levels from dark frames, and `--black`
+  sets them directly, for `dng`, `stack`, and `sr`. This removes the colour cast in
+  stacked shadows caused by camera black levels a fraction of a DN too high.
+- `--black auto` for `stack` and `sr` normalizes the merged result so the darkest 64×64 px
+  areas average exactly black, per CFA site, without dark frames. `--black pixel`
+  uses the single darkest merged sample instead, for comparison.
+- Stack alignment limits Catmull-Rom interpolation to the nearest samples' range.
+  Bright lights no longer leave dark rims hundreds of DN below black, which raw
+  converters clipped to black dots around street lights in night bursts.
+
 ## 0.2.0 — 2026-11-24
 
 - Shared NEV, NEF, NRW, and Bayer DNG input for conversion, stacking, SR, and folder inspection.

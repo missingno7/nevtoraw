@@ -185,6 +185,45 @@ for options in (["--threads", "0"], ["--threads", "1025"], ["--threads", "-1"],
     run("dng", source, *options, code=2)
 run("dng", source, "--temp-dir", root / "missing-directory", code=1)
 
+# User and dark-frame black levels are shared by conversion, stacking and SR.
+dark = Path("out/raw-input-tests/dark")
+measured = "measured black R 1000.00 Gr 1001.00 Gb 1002.00 B 999.00 DN"
+text = run("dng", source, "--dark", dark, "-c", "none", "-o", root / "dark-dng")
+assert "dark frames: 3" in text and measured in text and "3 outlier samples ignored" in text, text
+assert 50713 in tags(next((root / "dark-dng").glob("*.dng")))  # per-site BlackLevelRepeatDim
+text = run("stack", source, "--dark", dark, "--no-align", "-o", root / "dark-stack")
+assert measured in text
+assert b"black R 1000.00 Gr 1001.00 Gb 1002.00 B 999.00 DN from 3 dark frame(s)" in next((root / "dark-stack").glob("*.dng")).read_bytes()
+text = run("sr", source, "--black", "900,901.5,899.25", "--count", "1", "--crop", "3,5,12,10", "-o", root / "black-sr")
+assert "black levels: R 900.00 Gr 901.50 Gb 901.50 B 899.25 DN" in text
+assert b"black R 900.00 Gr 901.50 Gb 901.50 B 899.25 DN" in next((root / "black-sr").glob("*.dng")).read_bytes()
+for options in (["--black", "1,2"], ["--black", "65535"], ["--black", "x"], ["--black", "1000", "--dark", dark],
+                ["--black", "auto", "--dark", dark], ["--black", "auto", "--black", "1000"]):
+    run("stack", source, *options, code=2)
+text = run("stack", source, "--black", "auto", "--no-align", "-o", root / "auto-stack")
+assert "auto black: darkest areas" in text, text
+assert b", auto black R " in next((root / "auto-stack").glob("*.dng")).read_bytes()
+text = run("stack", source, "--black", "pixel", "--no-align", "-o", root / "pixel-stack")
+assert "auto black: darkest pixels" in text, text
+assert b", darkest-pixel black R " in next((root / "pixel-stack").glob("*.dng")).read_bytes()
+run("dng", source, "--black", "auto", code=2)
+run("dng", source, "--black", "pixel", code=2)
+run("stack", source, "--black", "pixel", "--black", "auto", "--black", "1000", code=2)
+run("sr", source, "--black", "auto", "--black", "1000", code=2)
+# SR records auto black as fractional DNG black levels: one per channel for LinearRaw,
+# a 2x2 per-site pattern for Bayer output.
+for mode, extra, count in (("auto", [], 3), ("pixel", ["--bayer"], 4)):
+    output = root / f"sr-black-{mode}"
+    text = run("sr", source, "--black", mode, "--count", "1", "--crop", "3,5,12,10", *extra, "-o", output)
+    assert ("auto black: darkest " + ("areas" if mode == "auto" else "pixels")) in text, text
+    path = next(output.glob("*.dng"))
+    kind, n, _ = tags(path)[50714]
+    assert (kind, n) == (5, count), (kind, n)
+    assert (b", auto black R " if mode == "auto" else b", darkest-pixel black R ") in path.read_bytes()
+assert "below the white level" in run("dng", source, "--white", "4095", "--black", "5000", code=1)
+assert "dark frames are 270x258" in run("dng", nrw, "--dark", dark, code=1)
+run("dng", source, "--dark", root / "missing-dark", code=1)
+
 # Folder outputs stay out of subsequent source scans.
 run("dng", burst)
 assert "17 files sorted by filename" in run("info", burst)

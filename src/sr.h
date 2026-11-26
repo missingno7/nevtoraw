@@ -12,6 +12,7 @@ struct SrOptions {
     bool linear = true;
     float kernel_sigma = 0.30f; // Gaussian width in input sensor pixels
     unsigned scale = 2;        // Output pixels per input sensor pixel, on each axis
+    AutoBlack auto_black = AutoBlack::Off; // measured on the reconstructed region
 };
 
 struct SrImage {
@@ -19,6 +20,8 @@ struct SrImage {
     bool linear = false;
     std::vector<uint16_t> pixels;
     std::shared_ptr<TiledImage> storage; // large output, bounded RAM with disk backing
+    double black_delta[3] = {};          // auto black per colour (R, G, B), output codes above black
+    double black_level[4] = {};          // source DN by colour (R, Gr, Gb, B)
 };
 
 using SaveSr = std::function<bool(size_t, const SrImage &, const MovieInfo &, const FrameInfo &)>;

@@ -21,6 +21,9 @@ enum class StackMerge {
 
 enum class StackAlignment { None, Tiles, Homography };
 
+// Post-merge black normalization per CFA site: darkest 64x64 px block means, or darkest single sample.
+enum class AutoBlack { Off, Area, Pixel };
+
 struct StackOptions {
     Crop crop;
     StackMerge merge = StackMerge::Mean;
@@ -28,6 +31,7 @@ struct StackOptions {
     StackAlignment alignment = StackAlignment::Homography;
     unsigned tile = 32;          // tile size in Bayer-plane pixels (= 2 sensor px)
     float z_lo = 3.0f, z_hi = 5.0f;  // robust weight: 1 below z_lo, 0 above z_hi
+    AutoBlack auto_black = AutoBlack::Off;
 };
 
 struct StackResult {
@@ -38,6 +42,7 @@ struct StackResult {
     FrameInfo info;
     std::vector<size_t> frames;
     size_t frames_used = 0;
+    double black_level[4] = {};          // source DN by colour (R, Gr, Gb, B) after auto black
 };
 
 using StackLog = std::function<void(const std::string &)>;

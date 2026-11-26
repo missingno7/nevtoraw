@@ -28,6 +28,8 @@ and [capture-format limits](raw-formats.md).
 | `-o, --output DIR` | Destination directory. Files default beside the source, folders to `SOURCE/nevtoraw`. |
 | `-c, --compression ljpeg\|none` | Lossless JPEG (default) or uncompressed 16-bit output. |
 | `--white N` | Override white level, integer 1–65535, above source black levels. NEV defaults to 16383. |
+| `--black LEVELS` | Source black level in DN, replacing the camera's: `N` for all colours, `R,G,B`, or `R,Gr,Gb,B` (Gr is the green on red rows). Fractions allowed. `stack` and `sr` also accept `auto` and `pixel`. |
+| `--dark PATH` | Measure per-colour black levels from dark frames: a folder, file, or NEV clip. Cannot accompany `--black`. |
 | `--crop X,Y,W,H` | Physical output region in coded source/reference sensor pixels, before orientation and SR scaling. Minimum 2×2. |
 | `--memory-limit SIZE` | Automatic by default: 70% of available physical memory/commit headroom. Override with an integer size such as `8G`, `512M`, or `auto`; suffixes use powers of 1024. |
 | `--threads N` | Shared worker limit, 1–1024. Default logical CPU count. Memory availability can reduce active jobs. |
@@ -52,6 +54,48 @@ Stacking aligns and merges full frames before extracting the crop, so its alignm
 and memory requirements are unchanged. SR reconstructs only the requested output
 region, retaining full-frame information for alignment. All coordinates and sizes
 are in input pixels; `--scale` multiplies the SR output dimensions afterward.
+
+## Black levels and dark frames
+
+Cameras record one black level per frame or per colour, and small errors in it
+are invisible in single frames. A stack removes most of the noise, so a colour
+whose true black is a fraction of a DN below the tag falls below black in the
+deepest shadows; raw converters clip it there and tint the darkest tones.
+
+`--dark PATH` reads every frame in PATH (same folder, file, and NEV rules as the
+input) and uses the robust mean of each colour as its black level: median ±6
+robust standard deviations, so hot pixels are ignored. Shoot 8–16 frames with the
+lens cap on at the same ISO and shutter speed, ideally right after the burst.
+The dark frames must have the input's coded size; a different camera model or ISO
+prints a warning. The measured levels, noise, and ignored samples are printed.
+
+`--black` sets levels directly, for example `--black 1008,1008,1007.4` for R, G,
+and B. Levels replace the source black level and per-CFA offsets for every frame.
+Conversion writes them as per-site DNG black levels; stacking and SR subtract them
+before merging and record them in the DNG description.
+
+`stack --black auto` normalizes the merged result instead: for each CFA site it
+takes the 64×64 px block means of the whole stacked frame and shifts the site so
+its darkest blocks average exactly zero. A low order statistic (the fifth-darkest
+block for a typical full frame) ignores a few defective blocks. Single pixels are
+not used because, after averaging, the darkest pixel is still mostly noise. This
+assumes the scene contains areas that receive essentially no light, such as night
+shadows; in a scene without them it would remove real signal. The chosen levels
+are printed and recorded in the DNG description. It cannot accompany `--dark` or
+numeric `--black` levels.
+
+`stack --black pixel` applies the same normalization with the single darkest
+merged sample of each CFA site, for comparison. It includes noise and any defect:
+in an aligned burst the darkest samples are usually at the frame edges, covered
+by fewer frames, so shadows are lifted by several DN.
+
+`sr --black auto|pixel` applies the same rules to the reconstructed output, with
+blocks of 64×64 input pixels (64 × `--scale` output pixels). SR measures only the
+region it reconstructs, so with a small `--crop` the darkest part of the crop may
+not be black; use levels from a full stack (`--black R,Gr,Gb,B`) instead. SR writes
+the result as fractional DNG black levels, per channel for LinearRaw and per CFA
+site for `--bayer`, so the samples are not requantized. Both greens share one
+estimate in SR.
 
 ## Frame count and reference (`stack` and `sr`)
 

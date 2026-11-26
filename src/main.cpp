@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // nevtoraw: extract frames of Nikon N-RAW (.NEV) video as DNG raw stills.
+#include "black.h"
 #include "dng.h"
 #include "input.h"
 #include "file_io.h"
@@ -12,6 +13,7 @@
 #include "read_queue.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +39,10 @@ static void usage(FILE *stream = stderr) {
             "  -o, --output DIR    output directory (file: beside source; folder: SOURCE/nevtoraw)\n"
             "  -c, --compression C ljpeg (default, lossless) | none\n"
             "      --white N       override source white level (NEV default 16383)\n"
+            "      --black LEVELS  source black level in DN: N | R,G,B | R,Gr,Gb,B (fractions allowed)\n"
+            "                      | auto (stack/sr: darkest 64x64 px areas of the result become black)\n"
+            "                      | pixel (stack/sr: darkest single pixel of each colour becomes black)\n"
+            "      --dark PATH     measure per-colour black levels from dark frames (folder, file or NEV)\n"
             "      --memory-limit N  RAM budget: auto (default), or e.g. 8G / 512M\n"
             "      --threads N     worker limit (default: logical CPU count)\n"
             "      --temp-dir DIR  scratch directory (default: system temporary directory)\n"
@@ -68,6 +74,36 @@ static bool parse_csv(std::string_view s, std::vector<size_t> &values) {
         s.remove_prefix(comma + 1);
     }
     return false;
+}
+
+// User or dark-frame black levels, applied to every frame as it is read.
+struct BlackOverride {
+    nev::BlackLevels levels;
+    nev::DarkFrames dark;
+    bool from_dark = false;
+    std::atomic<bool> warned{false};
+    std::string description() const {
+        if (!levels.set) return {};
+        return "black " + nev::describe_black_levels(levels) +
+               (from_dark ? " DN from " + std::to_string(dark.frames) + " dark frame(s)" : " DN");
+    }
+};
+
+static bool override_black(nev::RawPhoto &p, BlackOverride &black, std::string &err) {
+    if (!black.levels.set) return true;
+    if (black.from_dark) {
+        if (p.width != black.dark.width || p.height != black.dark.height) {
+            err = "dark frames are " + std::to_string(black.dark.width) + "x" + std::to_string(black.dark.height) +
+                  ", input is " + std::to_string(p.width) + "x" + std::to_string(p.height);
+            return false;
+        }
+        const bool iso = black.dark.iso && p.info.iso && black.dark.iso != p.info.iso;
+        const bool model = !black.dark.model.empty() && black.dark.model != p.movie.model;
+        if ((iso || model) && !black.warned.exchange(true))
+            fprintf(stderr, "warning: dark frames (%s, ISO %u) differ from the input (%s, ISO %u)\n",
+                    black.dark.model.c_str(), black.dark.iso, p.movie.model.c_str(), p.info.iso);
+    }
+    return nev::apply_black_levels(p, black.levels, err);
 }
 
 static int cmd_info(const std::string &path) {
@@ -123,7 +159,7 @@ static bool write_file(const nev::InputSource &source,const fs::path &out,const 
 }
 
 static int cmd_convert(const fs::path &input, const fs::path &output, const std::string &frames,
-                       nev::DngOptions options, bool white_given, const nev::Crop &crop) {
+                       nev::DngOptions options, bool white_given, const nev::Crop &crop, BlackOverride &black) {
     nev::InputSource source;
     std::string err;
     if (!source.open(input, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
@@ -132,7 +168,11 @@ static int cmd_convert(const fs::path &input, const fs::path &output, const std:
     const auto directory = output.empty() ? source.output_directory() : output;
     if (!directory.empty()) fs::create_directories(directory);
     int failed = 0;
-    nev::ReadPhoto read=[&](size_t index,nev::RawPhoto &photo,std::string &error){return source.read(index,photo,error);};
+    nev::ReadPhoto read=[&](size_t index,nev::RawPhoto &photo,std::string &error){
+        if(!source.read(index,photo,error))return false;
+        if(white_given)photo.white=options.white_level;
+        return override_black(photo,black,error);
+    };
     std::unique_ptr<nev::ReadQueue> reader;
     nev::MemoryLease workspace;
     for (size_t position=0;position<selected.size();++position) {
@@ -171,7 +211,8 @@ static int cmd_convert(const fs::path &input, const fs::path &output, const std:
 
 static int cmd_merge(const fs::path &input, const fs::path &output, const std::string &frames,
                   std::optional<size_t> requested_ref, std::optional<size_t> requested_count,
-                  nev::SrOptions sr, nev::StackOptions stack, nev::DngOptions dng, bool white_given, bool superresolution) {
+                  nev::SrOptions sr, nev::StackOptions stack, nev::DngOptions dng, bool white_given, bool superresolution,
+                  BlackOverride &black) {
     nev::InputSource source;
     std::string err;
     if (!source.open(input, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
@@ -184,6 +225,7 @@ static int cmd_merge(const fs::path &input, const fs::path &output, const std::s
     auto read = [&](size_t index, nev::RawPhoto &p, std::string &read_error) {
         if (!source.read(index, p, read_error)) return false;
         if (white_given) p.white = dng.white_level;
+        if (!override_black(p, black, read_error)) return false;
         if (p.white <= p.black) { read_error = "white level must exceed black level"; return false; }
         if (!nev::has_color_profile(p.movie, p.info)) {
             read_error = "no color calibration for " + p.movie.model + "; convert to Bayer DNG first";
@@ -217,6 +259,13 @@ static int cmd_merge(const fs::path &input, const fs::path &output, const std::s
                           " frames, reference " + std::to_string(ref) + ", " + alignment;
         if (trimmed) dng.description += ", trim " + std::to_string(stack.trim_percent) + "% per tail";
         if (stack.crop.enabled()) dng.description += ", " + nev::crop_description(stack.crop);
+        if (black.levels.set) dng.description += ", " + black.description();
+        if (stack.auto_black != nev::AutoBlack::Off) {
+            nev::BlackLevels levels;
+            std::copy(std::begin(result.black_level), std::end(result.black_level), levels.level);
+            dng.description += std::string(stack.auto_black == nev::AutoBlack::Pixel ? ", darkest-pixel black " : ", auto black ") +
+                               nev::describe_black_levels(levels) + " DN";
+        }
         dng.description += ", frames";
         std::sort(result.frames.begin(), result.frames.end());
         for (size_t index : result.frames) dng.description += " " + std::to_string(index);
@@ -238,11 +287,19 @@ static int cmd_merge(const fs::path &input, const fs::path &output, const std::s
     auto save = [&](size_t count, const nev::SrImage &image, const nev::MovieInfo &movie, const nev::FrameInfo &info) {
         dng.black_level = image.black; dng.white_level = image.white;
         dng.linear_rgb = image.linear;
+        for (unsigned c = 0; c < 3; ++c) dng.sample_black_delta[c] = image.linear ? image.black_delta[c] : 0;
         const std::string format = output_scale + (image.linear ? " LinearRaw" : " Bayer");
         dng.description = "nevtoraw " + format + ", " + std::to_string(count) +
                           " frame(s), reference " + std::to_string(ref);
         dng.description += ", " + std::string(kernel);
         if (sr.crop.enabled()) dng.description += ", " + nev::crop_description(sr.crop);
+        if (black.levels.set) dng.description += ", " + black.description();
+        if (sr.auto_black != nev::AutoBlack::Off) {
+            nev::BlackLevels levels;
+            std::copy(std::begin(image.black_level), std::end(image.black_level), levels.level);
+            dng.description += std::string(sr.auto_black == nev::AutoBlack::Pixel ? ", darkest-pixel black " : ", auto black ") +
+                               nev::describe_black_levels(levels) + " DN";
+        }
         dng.description += ", frames";
         for (size_t index : selected) dng.description += " " + std::to_string(index);
         const std::string suffix = "_sr" + output_scale +
@@ -299,6 +356,8 @@ static int run(int argc, char **argv) {
     nev::StackOptions sopt;
     nev::SrOptions sr_opt;
     bool trim_given = false, white_given = false, align_given = false, no_align_given = false, tile_given = false;
+    BlackOverride black;
+    std::string dark;
     for (int i = first; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
@@ -322,6 +381,16 @@ static int run(int argc, char **argv) {
             }
             opt.white_level = unsigned(value);
             white_given = true;
+        } else if (a == "--black") {
+            const std::string value = next();
+            if (value == "auto") sopt.auto_black = nev::AutoBlack::Area;
+            else if (value == "pixel") sopt.auto_black = nev::AutoBlack::Pixel;
+            else if (!nev::parse_black_levels(value, black.levels)) {
+                fprintf(stderr, "--black must be N, R,G,B or R,Gr,Gb,B with levels from 0 to 65534\n"); return 2;
+            }
+        } else if (a == "--dark") {
+            dark = next();
+            if (dark.empty()) { fprintf(stderr, "--dark requires a path\n"); return 2; }
         } else if ((stack || sr) && (a == "-r" || a == "--ref")) {
             size_t value;
             if (!nev::parse_number(next(), value)) { fprintf(stderr, "--ref must be a frame number\n"); return 2; }
@@ -399,11 +468,30 @@ static int run(int argc, char **argv) {
     if (no_align_given && (align_given || tile_given)) {
         fprintf(stderr, "--no-align cannot be combined with --align or --tile\n"); return 2;
     }
+    const bool auto_black = sopt.auto_black != nev::AutoBlack::Off;
+    if ((black.levels.set || auto_black) && !dark.empty()) {
+        fprintf(stderr, "--black cannot be combined with --dark\n"); return 2;
+    }
+    if (auto_black && (black.levels.set || !(stack || sr))) {
+        fprintf(stderr, "--black auto and pixel are available for stack and sr, without other --black levels\n"); return 2;
+    }
+    sr_opt.auto_black = sopt.auto_black;
     nev::configure_runtime(execution);
     struct Report {~Report(){nev::runtime().report();}} report;
     fprintf(stderr,"execution: %u workers, %.0f MiB RAM budget%s\n",nev::runtime().threads(),double(nev::runtime().limit())/(1<<20),execution.memory_limit?"":" (automatic)");
-    if (sr || stack) return cmd_merge(fs::u8path(path), fs::u8path(outdir), frames, ref, count, sr_opt, sopt, opt, white_given, sr);
-    return cmd_convert(fs::u8path(path), fs::u8path(outdir), frames, opt, white_given, sr_opt.crop);
+    if (!dark.empty()) {
+        std::string err;
+        const auto start = std::chrono::steady_clock::now();
+        if (!nev::measure_dark_frames(fs::u8path(dark), black.levels, black.dark, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        black.from_dark = true;
+        const auto &d = black.dark;
+        printf("dark frames: %zu (%s, ISO %u, %.6g s), camera black %u, %.1f s\n", d.frames, d.model.c_str(), d.iso,
+               double(d.exposure), d.camera_black, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        printf("  measured black %s DN; noise R %.2f Gr %.2f Gb %.2f B %.2f DN; %zu outlier samples ignored\n",
+               nev::describe_black_levels(black.levels).c_str(), d.noise[0], d.noise[1], d.noise[2], d.noise[3], d.rejected);
+    } else if (black.levels.set) printf("black levels: %s DN\n", nev::describe_black_levels(black.levels).c_str());
+    if (sr || stack) return cmd_merge(fs::u8path(path), fs::u8path(outdir), frames, ref, count, sr_opt, sopt, opt, white_given, sr, black);
+    return cmd_convert(fs::u8path(path), fs::u8path(outdir), frames, opt, white_given, sr_opt.crop, black);
 }
 
 static int guarded_run(int argc, char **argv) {

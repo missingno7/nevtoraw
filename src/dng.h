@@ -18,6 +18,7 @@ struct DngOptions {
     unsigned white_level = 16383;
     unsigned black_level = 1008;
     bool linear_rgb = false;   // interleaved R, G, B in camera-native color space
+    double sample_black_delta[3] = {}; // LinearRaw: per-channel black offsets in output codes
     std::string description;  // ImageDescription, optional
 };
 

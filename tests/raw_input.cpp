@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "black.h"
 #include "dng.h"
 #include "raw.h"
 #include "lj92.h"
@@ -590,9 +591,129 @@ static void atomic_output(const fs::path &dir) {
     for(const auto &entry:fs::directory_iterator(dir)) require(entry.path().extension()!=".part","temporary output leaked");
 }
 
+static void black_levels(const fs::path &dir) {
+    nev::BlackLevels b;
+    require(nev::parse_black_levels("1008",b)&&b.set&&b.level[0]==1008&&b.level[3]==1008,"single black level");
+    require(nev::parse_black_levels("1008,1007.5,1006.25",b)&&b.level[0]==1008&&b.level[1]==1007.5&&
+            b.level[2]==1007.5&&b.level[3]==1006.25,"R,G,B black levels");
+    require(nev::parse_black_levels("1,2,3,4",b)&&b.level[1]==2&&b.level[2]==3,"R,Gr,Gb,B black levels");
+    for(auto text:{"","1,","1,2","a","-1","65535","1,2,3,4,5","nan"," 1","1;2;3"})
+        require(!nev::parse_black_levels(text,b),"malformed black level accepted");
+    // Colour slots: R, green on the red row, green on the blue row, B.
+    const unsigned rggb[4]={0,1,1,2},bggr[4]={2,1,1,0},grbg[4]={1,0,2,1};
+    const std::array<unsigned,4> want_rggb{0,1,2,3},want_bggr{3,2,1,0},want_grbg{1,0,3,2};
+    for(unsigned k=0;k<4;++k)
+        require(nev::black_slot(rggb,k)==want_rggb[k]&&nev::black_slot(bggr,k)==want_bggr[k]&&nev::black_slot(grbg,k)==want_grbg[k],
+                "wrong black-level colour slot");
+
+    nev::RawPhoto photo;photo.width=4;photo.height=4;photo.black=1008;photo.white=16383;
+    std::copy_n(bggr,4,photo.info.cfa);photo.info.black_delta[0]=5;
+    std::string err;
+    require(nev::parse_black_levels("1008,1008.5,1007.75,1007.25",b)&&nev::apply_black_levels(photo,b,err),err.c_str());
+    require(photo.black==1007,"black baseline is not the lowest level");
+    const std::array<float,4> deltas{.25f,.75f,1.5f,1.f}; // B, Gb, Gr, R sites
+    for(unsigned k=0;k<4;++k) require(photo.info.black_delta[k]==deltas[k],"black levels landed on the wrong CFA sites");
+    require(nev::parse_black_levels("20000",b)&&!nev::apply_black_levels(photo,b,err),"black level above white accepted");
+
+    // Dark frames: per-colour robust means, hot pixels ignored, CFA independent of the input.
+    auto darkdir=dir/"dark";fs::create_directories(darkdir);
+    const unsigned w=270,h=258;const std::array<int,4> base{1000,1001,1002,999};
+    auto m=camera();nev::FrameInfo fi;std::copy_n(rggb,4,fi.cfa);fi.iso=64;
+    nev::DngOptions opt;opt.compression=nev::DngCompression::None;opt.black_level=900;opt.white_level=65535;
+    for(int frame=0;frame<3;++frame) {
+        std::vector<uint16_t> px(size_t(w)*h);
+        for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)
+            px[size_t(y)*w+x]=uint16_t(base[nev::black_slot(rggb,(y&1)*2+(x&1))]+(((x/2+y/2+frame)&1)?2:-2));
+        px[size_t(40)*w+60]=60000; // hot red sample
+        write(darkdir/("dark_"+std::to_string(frame)+".dng"),nev::build_dng(px,w,h,m,fi,0,"dark",opt));
+    }
+    nev::DarkFrames info;
+    require(nev::measure_dark_frames(darkdir,b,info,err),err.c_str());
+    require(info.frames==3&&info.width==w&&info.height==h&&info.iso==64&&info.rejected==3,"dark-frame summary wrong");
+    for(unsigned c=0;c<4;++c)
+        require(std::abs(b.level[c]-base[c])<.01&&std::abs(info.noise[c]-2)<.01,"dark-frame black level wrong");
+    require(!nev::measure_dark_frames(dir/"missing-dark",b,info,err),"missing dark frames accepted");
+
+    // Fractional levels survive stacking exactly (mean merge keeps float samples).
+    require(nev::parse_black_levels("100.25,101.5,102,98.75",b),"fractional levels");
+    nev::RawPhoto raw;raw.width=12;raw.height=12;raw.black=100;raw.white=16383;raw.movie=camera();
+    std::copy_n(rggb,4,raw.info.cfa);
+    const std::array<uint16_t,4> level{600,602,602,599};
+    raw.pixels.resize(144);
+    for(unsigned y=0;y<12;++y)for(unsigned x=0;x<12;++x)raw.pixels[y*12+x]=level[(y&1)*2+(x&1)];
+    auto read=[&](size_t,nev::RawPhoto &p,std::string &e){p=raw;return nev::apply_black_levels(p,b,e);};
+    nev::StackOptions stack;stack.alignment=nev::StackAlignment::None;
+    nev::StackResult result;
+    require(nev::stack_frames(read,{0,1,2},1,stack,result,err,[](const auto&){}),err.c_str());
+    const std::array<uint16_t,4> expected{2391,2394,2392,2393};
+    require(result.black==392,"stack output black ignores user levels");
+    for(unsigned y=0;y<12;++y)for(unsigned x=0;x<12;++x)
+        require(result.px[y*12+x]==expected[(y&1)*2+(x&1)],"user black levels not subtracted per colour");
+
+    // --black auto: the darkest 64x64 px areas become black per site; one outlier block is ignored.
+    const unsigned aw=320,ah=256; // 5x4 blocks of 32x32 quads
+    nev::RawPhoto scene;scene.width=aw;scene.height=ah;scene.black=100;scene.white=16383;scene.movie=camera();
+    std::copy_n(rggb,4,scene.info.cfa);scene.pixels.resize(size_t(aw)*ah);
+    const std::array<int,4> dark_level{100,101,100,99},bright{150,150,150,150};
+    for(unsigned y=0;y<ah;++y)for(unsigned x=0;x<aw;++x){
+        const unsigned k=(y&1)*2+(x&1),bx=x/64,by=y/64;
+        int v=(bx==0&&by<2)?dark_level[k]:bright[k];
+        if(bx==2&&by==0&&k==3)v=80; // a single much darker blue block, e.g. a defect
+        scene.pixels[size_t(y)*aw+x]=uint16_t(v);
+    }
+    auto read_scene=[&](size_t,nev::RawPhoto &p,std::string&){p=scene;return true;};
+    stack.auto_black=nev::AutoBlack::Area;
+    for(auto merge:{nev::StackMerge::Mean,nev::StackMerge::TrimmedMean}){
+        stack.merge=merge;
+        require(nev::stack_frames(read_scene,{0,1,2},1,stack,result,err,[](const auto&){}),err.c_str());
+        require(result.black==400,"auto black changed the output black code");
+        const std::array<double,4> levels{100,101,100,99};
+        for(unsigned c=0;c<4;++c) require(std::abs(result.black_level[c]-levels[c])<1e-4,"auto black level wrong");
+        for(unsigned y=0;y<ah;++y)for(unsigned x=0;x<aw;++x){
+            const unsigned k=(y&1)*2+(x&1),bx=x/64,by=y/64;
+            const std::array<uint16_t,4> lit{600,596,600,604};
+            const uint16_t want=(bx==0&&by<2)?400:(bx==2&&by==0&&k==3)?324:lit[k];
+            require(result.px[size_t(y)*aw+x]==want,"auto black did not normalize the darkest areas");
+        }
+    }
+    // --black pixel: the single darkest sample of each site becomes black, outliers included.
+    stack.auto_black=nev::AutoBlack::Pixel;stack.merge=nev::StackMerge::Mean;
+    require(nev::stack_frames(read_scene,{0,1,2},1,stack,result,err,[](const auto&){}),err.c_str());
+    const std::array<double,4> pixel_levels{100,101,100,80};
+    for(unsigned c=0;c<4;++c) require(std::abs(result.black_level[c]-pixel_levels[c])<1e-4,"darkest-pixel black level wrong");
+    require(result.px[0]==400&&result.px[size_t(aw)+1]==(99-80)*4+400&&result.px[size_t(aw)+129]==400,
+            "darkest-pixel black did not shift each site by its minimum");
+
+    // SR measures the reconstructed output and stores the result as DNG black levels,
+    // leaving the samples unchanged: R 1000, G 1010, B 1030 DN above the source black.
+    nev::RawPhoto sr_raw;sr_raw.width=32;sr_raw.height=24;sr_raw.black=500;sr_raw.white=16000;sr_raw.movie=camera();
+    std::copy_n(rggb,4,sr_raw.info.cfa);sr_raw.pixels.resize(32*24);
+    const std::array<uint16_t,4> sr_level{1500,1510,1510,1530};
+    for(unsigned y=0;y<24;++y)for(unsigned x=0;x<32;++x)sr_raw.pixels[y*32+x]=sr_level[(y&1)*2+(x&1)];
+    for(auto mode:{nev::AutoBlack::Area,nev::AutoBlack::Pixel}) for(bool linear:{true,false}) {
+        nev::SrOptions sr;sr.scale=1;sr.linear=linear;sr.auto_black=mode;bool saved=false;
+        require(nev::superresolve([&](size_t,nev::RawPhoto &p,std::string&){p=sr_raw;return true;},{0},0,sr,
+          [&](size_t,const nev::SrImage &image,const nev::MovieInfo &,const nev::FrameInfo &fi){
+            saved=true;
+            const std::array<double,3> codes{4000,4040,4120};
+            const std::array<double,4> levels{1500,1510,1510,1530};
+            for(unsigned c=0;c<3;++c) require(std::abs(image.black_delta[c]-codes[c])<1e-3,"SR auto black offset wrong");
+            for(unsigned c=0;c<4;++c) require(std::abs(image.black_level[c]-levels[c])<1e-3,"SR auto black level wrong");
+            for(unsigned k=0;k<4;++k)
+                require(std::abs(fi.black_delta[k]-(linear?0:codes[rggb[k]]))<1e-3,"SR Bayer black pattern wrong");
+            // R, G, B samples: interleaved for LinearRaw, sites (0,0), (1,0), (1,1) for Bayer.
+            require(image.pixels[0]==6000&&image.pixels[1]==6040&&image.pixels[linear?2:33]==6120,
+                    "SR auto black changed the samples");
+            return true;
+          },err,[](const auto&){}),err.c_str());
+        require(saved,"SR output not saved");
+    }
+}
+
 int main() {
     try {
         auto dir=fs::path("out")/"raw-input-tests";fs::create_directories(dir);
+        black_levels(dir);
         roundtrip(dir);
         for(unsigned bits:{8,12,14,16}) for(bool little:{false,true}) packed(dir,bits,little);
         sr_black();
